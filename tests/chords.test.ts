@@ -17,10 +17,11 @@ import {
   presentPitchClasses,
   type ChordSpec,
 } from '../src/lib/chroma';
-import { FRAME_SIZE, MIN_TOP_SCORE } from '../src/lib/thresholds';
+import { FRAME_SIZE, MIN_RUNNER_UP_MARGIN, MIN_TOP_SCORE } from '../src/lib/thresholds';
 import { OPEN_CHORDS } from '../src/lessons/openChords';
 import {
   addHum,
+  addNote,
   addNoise,
   chord,
   DEFAULT_SAMPLE_RATE,
@@ -272,5 +273,155 @@ describe('missing-tone advice is confidence-aware', () => {
 
   it('returns null rather than guessing on a non-finite SNR', () => {
     expect(missingTones(chromaFor(VOICINGS.C), C, -Infinity)).toBeNull();
+  });
+});
+
+describe('the top-match gate means top-1, not "somewhere in the top 3"', () => {
+  /**
+   * An earlier implementation accepted the expected chord if it appeared
+   * anywhere in the top few matches, which is nearly free to satisfy: the
+   * templates for a root and its relative minor, its sevenths and its sus
+   * variants all sit within a few percent of each other, so the correct answer
+   * is almost always in the top 3 no matter what was played.
+   */
+  /** 1-based rank of the expected chord among all 60 templates. */
+  const rankOf = (signal: Float32Array, expected: ChordSpec) =>
+    matchChord(analyzer.analyze(signal, SR, 0.0005).chroma!, 60).findIndex(
+      (m) => m.root === expected.root && m.quality === expected.quality,
+    ) + 1;
+
+  it('rejects the expected chord when it is the runner-up rather than the best', () => {
+    // Measured: a Csus4 read against C puts C second at 0.770 behind Csus4 at
+    // 0.954. This is the case a top-3 test would wave through, and the one a
+    // beginner actually produces — the index finger lands on the wrong fret.
+    const signal = sig(VOICINGS.Csus4);
+    expect(rankOf(signal, C)).toBe(2);
+    expect(evaluate(signal, C)!.check.isTopMatch).toBe(false);
+    expect(accepts(signal, C)).toBe(false);
+  });
+
+  it.each([
+    ['A major played, Am wanted', VOICINGS.A, Am],
+    ['Am played, A major wanted', VOICINGS.Am, A],
+    ['E major played, Em wanted', VOICINGS.E, Em],
+  ])('%s: ranks outside the top 3 and is rejected', (_label, voicing, expected) => {
+    // These fall further than expected — rank 4 to 6 — because a major/minor
+    // swap moves a whole pitch class. Asserted so that a regression which
+    // merely blurs the templates together shows up here.
+    const signal = sig(voicing);
+    expect(rankOf(signal, expected as ChordSpec)).toBeGreaterThan(3);
+    expect(evaluate(signal, expected as ChordSpec)!.check.isTopMatch).toBe(false);
+    expect(accepts(signal, expected as ChordSpec)).toBe(false);
+  });
+});
+
+describe('the runner-up margin gate', () => {
+  it('rejects a stray F once it is as prominent as the chord tones', () => {
+    // The realistic version of this error — F *replacing* the high E, i.e. a
+    // finger on the wrong fret — is rejected outright (C_wrongNote, above).
+    // This is the harder variant: a full, correct C with an extra F added on
+    // top. Sweep the stray note's level rather than trusting one amplitude.
+    //
+    // KNOWN LIMITATION, measured, not fixed here. Below ~0.3 (chord tones at
+    // 0.25) this is accepted as a clean C, and it is not separable from a
+    // legitimate chord using anything the pipeline currently computes:
+    //
+    //   C + stray F @0.15   5 pitch classes, 2 foreign, score 0.901  (wrong)
+    //   C bright rolloff .5 5 pitch classes, 2 foreign, score 0.896  (correct)
+    //
+    // The wrong one scores *higher*, so no threshold on score, pitch-class
+    // count or foreign-tone count separates them; raising MIN_TOP_SCORE would
+    // reject the legitimate bright chord first. Separating them needs a gate
+    // the pipeline does not have — per-tone harmonic-leakage accounting, the
+    // major-third test generalized to every sounding pitch class — and that
+    // must be validated against real recordings before it goes in, not tuned
+    // against these synthetic tones. Recorded here so the gap is visible.
+    for (const strayAmplitude of [0.3, 0.4, 0.5]) {
+      const signal = sig(VOICINGS.C);
+      addNote(signal, 65, SR, { amplitude: strayAmplitude, harmonics: 8, rolloff: 1 });
+      expect(accepts(signal, C)).toBe(false);
+    }
+  });
+
+  it('rejects a wrong note that replaces a chord tone at every level', () => {
+    // The beginner error that actually happens, and the one that must not slip:
+    // the finger is on the wrong fret, so the F is there instead of the E.
+    for (const amplitude of [0.1, 0.15, 0.2, 0.25, 0.3, 0.4]) {
+      expect(accepts(sig(VOICINGS.C_wrongNote, { amplitude }), C)).toBe(false);
+    }
+  });
+
+  it('excludes same-root extensions, so a C7 reading does not fail a C', () => {
+    const check = evaluate(sig(VOICINGS.C), C)!.check;
+    // The nearest rival considered for the margin must not be a C7 or similar.
+    expect(check.rival && isBenignRival(C, check.rival)).toBeFalsy();
+    expect(check.margin).toBeGreaterThanOrEqual(MIN_RUNNER_UP_MARGIN);
+  });
+
+  it('reports the strongest non-benign rival, not merely the second entry', () => {
+    const check = evaluate(sig(VOICINGS.C), C)!.check;
+    const all = matchChord(analyzer.analyze(sig(VOICINGS.C), SR, 0.0005).chroma!, 60);
+    const strongestNonBenign = all.find(
+      (m) => !(m.root === C.root && m.quality === C.quality) && !isBenignRival(C, m),
+    )!;
+    expect(check.rival?.name).toBe(strongestNonBenign.name);
+  });
+});
+
+describe('the characteristic-tone gate covers every quality-defining tone', () => {
+  it('requires the seventh of a dom7, not only its third', () => {
+    // characteristicInterval() returns the third for dom7, so checking only
+    // that interval let a plain major triad satisfy the quality gate of the
+    // corresponding seventh chord. Nothing in the lesson uses sevenths yet;
+    // this keeps the hole closed before one does.
+    const triad = evaluate(sig(VOICINGS.C), { root: 0, quality: 'dom7' })!;
+    expect(triad.check.hasCharacteristicTone).toBe(false);
+    expect(triad.check.passes).toBe(false);
+  });
+
+  it('requires the seventh of a min7 too', () => {
+    const triad = evaluate(sig(VOICINGS.Am), { root: 9, quality: 'min7' })!;
+    expect(triad.check.hasCharacteristicTone).toBe(false);
+  });
+
+  it('accepts a real seventh chord that actually contains its seventh', () => {
+    // C7: C E G Bb.
+    const real = evaluate(sig([48, 52, 55, 58, 64]), { root: 0, quality: 'dom7' })!;
+    expect(real.check.hasCharacteristicTone).toBe(true);
+  });
+
+  it('is unchanged for the triads the lesson actually teaches', () => {
+    for (const shape of OPEN_CHORDS) {
+      const voicing = VOICINGS[shape.id.toUpperCase() as keyof typeof VOICINGS] ??
+        VOICINGS[(shape.id === 'am' ? 'Am' : shape.id === 'em' ? 'Em' : shape.id.toUpperCase()) as keyof typeof VOICINGS];
+      const result = evaluate(sig(voicing), { root: shape.root, quality: shape.quality })!;
+      expect(result.check.hasCharacteristicTone).toBe(true);
+    }
+  });
+});
+
+describe('a major third must beat the root\'s own fifth harmonic', () => {
+  it('rejects a bare root whose harmonics alone put energy at the third', () => {
+    // Sweep harmonic richness: a brighter tone puts more energy at harmonic 5,
+    // which is the pitch class of the major third. None of these is a chord.
+    for (const rolloff of [0.5, 0.7, 1.0, 1.3]) {
+      const result = evaluate(sig([48], { rolloff }), C)!;
+      expect(result.check.hasCharacteristicTone).toBe(false);
+      expect(accepts(sig([48], { rolloff }), C)).toBe(false);
+    }
+  });
+
+  it('rejects a power chord however bright the tone', () => {
+    for (const rolloff of [0.5, 0.7, 1.0, 1.3]) {
+      expect(accepts(sig(VOICINGS.C5, { rolloff }), C)).toBe(false);
+    }
+  });
+
+  it('gives the minor third no harmonic discount, since it is not in the series', () => {
+    // Em contains a G at 3 semitones above E; harmonic 5 of E is G#, not G, so
+    // any energy at the minor third was genuinely fretted.
+    expect(evaluate(sig(VOICINGS.Em), Em)!.check.hasCharacteristicTone).toBe(true);
+    // ...and a bare E must still fail it.
+    expect(evaluate(sig([40]), Em)!.check.hasCharacteristicTone).toBe(false);
   });
 });

@@ -26,6 +26,24 @@ export const FRAME_SIZE = 8192;
 export const HOP_SIZE = 2048;
 
 /**
+ * How many hops may be outstanding in the analysis Worker before the main
+ * thread starts dropping them.
+ *
+ * postMessage queues without bound. If the Worker ever falls behind — a GC
+ * pause, a throttled background tab, a slow machine — hops accumulate at 8 KB
+ * and ~46 ms of latency each, and the coach ends up commenting on audio from
+ * several seconds ago while memory climbs. Dropping the newest hop instead
+ * bounds latency to MAX_INFLIGHT_HOPS x 46 ms (~280 ms at 6).
+ *
+ * Dropping is safe because the Worker treats a gap in the sequence as a
+ * discontinuity and refills its whole window before analysing again, so no
+ * decision is ever computed from spliced audio. Normal operation sits at 0-1
+ * outstanding (analysis costs ~1 ms against a 46 ms budget), so this only
+ * engages under genuine overload.
+ */
+export const MAX_INFLIGHT_HOPS = 6;
+
+/**
  * YIN is O(window x maxLag), the single most expensive step in the pipeline.
  * Guitar fundamentals top out around 1.2 kHz, so quarter rate (11 kHz, Nyquist
  * 5.5 kHz) discards nothing we use.
@@ -79,6 +97,26 @@ export const CALIBRATION_PERCENTILE = 0.8;
 /** Fallback floor if calibration is skipped or produced nothing usable. */
 export const DEFAULT_NOISE_FLOOR = SILENCE_RMS_ABSOLUTE;
 
+/**
+ * Per-silent-frame rate at which the noise floor drifts toward the level
+ * actually observed between strums. 0.02 at ~21 fps has a time constant of
+ * ~2.4 s, which tracks a fan switching on without chasing the tail of a decaying
+ * chord.
+ */
+export const NOISE_FLOOR_ADAPT_RATE = 0.02;
+
+/**
+ * Hard band the adapted floor is clamped to, as a multiple of the calibrated
+ * floor. This is a safety bound, not a tuning knob: adaptation is fed by frames
+ * that are by definition below the gate, and the gate is NOISE_FLOOR_MARGIN
+ * times the floor, so an unclamped average can ratchet upward without limit —
+ * each rise admits louder frames as "silence", which raises the floor again,
+ * until the player's actual guitar reads as silence. 4x gives real rooms room
+ * to drift while making runaway impossible.
+ */
+export const NOISE_FLOOR_ADAPT_MIN = 0.25;
+export const NOISE_FLOOR_ADAPT_MAX = 4;
+
 // ---------------------------------------------------------------------------
 // Chroma
 // ---------------------------------------------------------------------------
@@ -116,6 +154,14 @@ export const SILENCE_RESET_MS = 400;
  * 0.94-0.98; power chords and single notes land at 0.77-0.91. This sits above
  * the noise but is NOT by itself sufficient — see the gates below, which are
  * what actually separate a triad from a loud single note.
+ *
+ * Deliberately NOT raised to close the added-wrong-note gap. A correct C with
+ * an extra F added at half the chord's level scores 0.901 while a legitimate
+ * bright C (rolloff 0.5) scores 0.896 — the wrong reading scores higher, so
+ * every value that rejects the first rejects the second too. Cosine similarity
+ * cannot separate those; see tests/chords.test.ts, "rejects a stray F once it
+ * is as prominent as the chord tones", for the measurements and for what a
+ * real fix would need.
  */
 export const MIN_TOP_SCORE = 0.86;
 

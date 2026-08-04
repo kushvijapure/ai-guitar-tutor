@@ -53,6 +53,21 @@ const INDEX_MCP = 5;
 const MIDDLE_MCP = 9;
 const PINKY_MCP = 17;
 
+/**
+ * Below this PIP interior angle the reading is not a finger.
+ *
+ * A human PIP flexes to about 100-110 degrees, leaving an interior angle near
+ * 70-80; it physically cannot fold tighter. Anything under 30 is landmark
+ * garbage — a collapsed or swapped joint — and must be refused rather than
+ * coached as "over-curled". Set well below the anatomical limit so it only ever
+ * catches the impossible, never a genuinely tight hand.
+ *
+ * NOTE: this lives here rather than in thresholds.ts with its siblings only
+ * because that file is owned by another workstream in the current split. It
+ * belongs there.
+ */
+const MIN_ANATOMICAL_PIP_ANGLE = 30;
+
 export type FingerName = 'index' | 'middle' | 'ring' | 'pinky';
 
 /**
@@ -197,6 +212,72 @@ export function resolveHandedness(label: string, inputMirrored: boolean): string
   return label === 'Left' ? 'Right' : 'Left';
 }
 
+/** Just enough of a tracked hand to choose between them. */
+export interface HandCandidate {
+  /** Already passed through resolveHandedness. */
+  handedness: string;
+}
+
+export interface HandSelection {
+  /** Index into the input array, or -1 if no hand can be used. */
+  index: number;
+  /**
+   * Non-null only when a hand *was* present but could not be identified — the
+   * UI should show this as "unable to assess". Null means simply "the fretting
+   * hand is not in frame", which the UI phrases differently.
+   */
+  reason: string | null;
+}
+
+/**
+ * Pick the hand on the neck, or refuse to.
+ *
+ * The naive version of this is `hands.find(h => h.handedness === frettingHand)`,
+ * which has a failure mode that matters a great deal here: MediaPipe can label
+ * BOTH detected hands the same way. That is not rare in this application — the
+ * strumming hand is frequently half out of frame or occluded by the guitar body,
+ * which is exactly when its handedness classification degrades. Taking the first
+ * match then coaches a coin-flip hand with full confidence, and finger-arch
+ * advice aimed at the strumming hand is nonsense the player cannot act on.
+ *
+ * So when two hands both claim to be the fretting hand, we decline. One
+ * ambiguous frame costs the player nothing; one confident wrong verdict costs
+ * them trust in every verdict after it.
+ *
+ * Note this is orthogonal to which physical hand frets: `frettingHand` is the
+ * player's own setting ('Left' for a standard right-handed player, 'Right' for a
+ * left-handed player on a left-handed guitar), so both cases go through the
+ * same path and neither is special-cased.
+ */
+export function selectFrettingHand(
+  hands: ReadonlyArray<HandCandidate>,
+  frettingHand: string,
+): HandSelection {
+  const matches: number[] = [];
+  for (let i = 0; i < hands.length; i++) {
+    if (hands[i].handedness === frettingHand) matches.push(i);
+  }
+
+  if (matches.length === 1) return { index: matches[0], reason: null };
+  if (matches.length === 0) return { index: -1, reason: null };
+
+  return {
+    index: -1,
+    reason:
+      `Two hands in frame both look like your ${frettingHand.toLowerCase()} hand, ` +
+      `so I can't tell which one is on the neck. Move the strumming hand out of ` +
+      `shot, or angle the camera at the neck.`,
+  };
+}
+
+/**
+ * An "I cannot judge this" report, for callers that detect a problem upstream of
+ * the geometry (e.g. they cannot identify which hand is which).
+ */
+export function unassessable(reason: string, activeFingers: FingerName[]): PostureReport {
+  return unreliable(reason, activeFingers);
+}
+
 /** Fingers a chord shape actually asks you to fret. */
 export function activeFingersFor(fingers: ReadonlyArray<number | null>): FingerName[] {
   const set = new Set<FingerName>();
@@ -254,6 +335,14 @@ function measureFinger(
   if (!Number.isFinite(angle)) {
     return { angle: NaN, reliable: false, reason: 'degenerate geometry' };
   }
+  if (angle < MIN_ANATOMICAL_PIP_ANGLE) {
+    // Not a very curled finger — not a finger at all. A human PIP flexes to
+    // roughly 100-110 degrees, i.e. an interior angle around 70-80, and cannot
+    // fold back on itself. A reading this far past the anatomical limit means
+    // the landmarks are wrong, and "you are over-curling" would be a confident
+    // correction derived from noise.
+    return { angle: NaN, reliable: false, reason: 'joint angle not anatomically possible' };
+  }
 
   return { angle, reliable: true };
 }
@@ -280,6 +369,13 @@ export function analyzePosture(input: PostureInput): PostureReport {
   }
 
   // Clipping check runs in raw image space, where the frame edge is 0 and 1.
+  //
+  // The knuckle span (index MCP to pinky MCP) is required even when the chord
+  // uses neither finger. It is deliberately a wider basis than the judgement
+  // strictly needs: it is what establishes that the whole hand is inside the
+  // frame. Narrowing it to just the fretted fingers would let a hand that is
+  // half out of shot through the gate, and a hand at the frame boundary is
+  // precisely where MediaPipe starts extrapolating landmarks it cannot see.
   const required = new Set<number>([WRIST, MIDDLE_MCP, INDEX_MCP, PINKY_MCP]);
   for (const f of activeFingers) for (const j of FINGER_JOINTS[f]) required.add(j);
   for (const idx of required) {
@@ -405,10 +501,21 @@ export function analyzePosture(input: PostureInput): PostureReport {
   };
 }
 
-/** Angle of the knuckle line away from the image horizontal, 0..90 degrees. */
+/**
+ * Angle of the knuckle line away from the image horizontal, 0..90 degrees.
+ *
+ * @returns NaN when the knuckle landmarks are unusable, which suppresses the
+ *          observation rather than inventing one — these landmarks are not part
+ *          of the required set, so this is the normal path when the pinky
+ *          knuckle is occluded.
+ */
 function palmTilt(space: Landmark[]): number {
-  const dx = space[PINKY_MCP].x - space[INDEX_MCP].x;
-  const dy = space[PINKY_MCP].y - space[INDEX_MCP].y;
+  const index = space[INDEX_MCP];
+  const pinky = space[PINKY_MCP];
+  if (!isFinite3(index) || !isFinite3(pinky)) return NaN;
+
+  const dx = pinky.x - index.x;
+  const dy = pinky.y - index.y;
   const deg = Math.abs((Math.atan2(dy, dx) * 180) / Math.PI);
   return Math.min(deg, 180 - deg);
 }

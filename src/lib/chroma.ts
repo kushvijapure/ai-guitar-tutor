@@ -269,17 +269,33 @@ export function checkExpectedChord(
   // Minor thirds and fourths get no such discount: neither appears in the low
   // harmonic series of the root, so any energy at those pitch classes was
   // genuinely played. This asymmetry is physical, not a tuning fudge.
-  const interval = characteristicInterval(expected.quality);
-  const tone = chroma[(expected.root + interval) % 12];
+  //
+  // Every tone that is neither the root nor the fifth must clear its bar, not
+  // just the first one. For major, minor and sus4 there is exactly one such
+  // tone and this is unchanged. For the seventh chords it also requires the
+  // seventh, which previously went unchecked: characteristicInterval() returns
+  // the third for dom7/min7, so a plain triad satisfied the quality gate of the
+  // corresponding seventh chord outright. Nothing in the current lesson uses a
+  // seventh, so this closes the hole before a lesson can walk into it.
   const rootEnergy = chroma[expected.root % 12];
-  const requiredTone =
-    interval === 4
-      ? Math.max(
-          PRESENCE_THRESHOLD,
-          rootEnergy * MAJOR_THIRD_HARMONIC_LEAKAGE * THIRD_SAFETY_FACTOR,
-        )
-      : PRESENCE_THRESHOLD;
-  const hasCharacteristicTone = tone >= requiredTone;
+  const defining = (QUALITIES[expected.quality] ?? QUALITIES.major).filter(
+    (i) => i !== 0 && i !== 7,
+  );
+  let hasCharacteristicTone = defining.length > 0;
+  for (const interval of defining) {
+    const tone = chroma[(expected.root + interval) % 12];
+    const requiredTone =
+      interval === 4
+        ? Math.max(
+            PRESENCE_THRESHOLD,
+            rootEnergy * MAJOR_THIRD_HARMONIC_LEAKAGE * THIRD_SAFETY_FACTOR,
+          )
+        : PRESENCE_THRESHOLD;
+    if (tone < requiredTone) {
+      hasCharacteristicTone = false;
+      break;
+    }
+  }
 
   return {
     score,

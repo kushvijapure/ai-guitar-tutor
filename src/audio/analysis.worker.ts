@@ -11,7 +11,7 @@
  * to re-render. Throttling the UI therefore cannot weaken the gates.
  */
 
-import { FrameAnalyzer } from '../lib/analyzer';
+import { FrameAnalyzer, HopWindow } from '../lib/analyzer';
 import { ChordDecider } from '../lib/chordDecision';
 import type { ChordSpec } from '../lib/chroma';
 import { FRAME_SIZE, HOP_SIZE } from '../lib/thresholds';
@@ -25,11 +25,17 @@ let analyzer = new FrameAnalyzer(frameSize);
 let decider = new ChordDecider();
 let expected: ChordSpec = { root: 0, quality: 'major' };
 
-/** Rolling window of the most recent frameSize samples. */
-let ring = new Float32Array(frameSize);
-let hopsBuffered = 0;
+/** Rolling window of the most recent frameSize samples, and its drop handling. */
+let hopWindow = new HopWindow(frameSize, hopSize);
 
-const stats: AnalysisStats = { received: 0, analysed: 0, overBudget: 0, meanMs: 0, worstMs: 0 };
+const stats: AnalysisStats = {
+  received: 0,
+  dropped: 0,
+  analysed: 0,
+  overBudget: 0,
+  meanMs: 0,
+  worstMs: 0,
+};
 
 function post(message: FromWorker): void {
   (self as unknown as Worker).postMessage(message);
@@ -46,8 +52,7 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
         hopSize = message.hopSize;
         analyzer = new FrameAnalyzer(frameSize);
         decider = new ChordDecider();
-        ring = new Float32Array(frameSize);
-        hopsBuffered = 0;
+        hopWindow = new HopWindow(frameSize, hopSize);
         resetStats();
         break;
 
@@ -56,18 +61,19 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
         break;
 
       case 'calibrate':
-        decider.beginCalibration(performance.now());
+        // No timestamp: the decider times the window against the frame clock,
+        // which is the AudioContext's, not this thread's performance.now().
+        decider.beginCalibration();
         break;
 
       case 'reset':
         decider.reset();
-        hopsBuffered = 0;
-        ring.fill(0);
+        hopWindow.reset();
         resetStats();
         break;
 
       case 'audio':
-        handleAudio(message.samples, message.time);
+        handleAudio(message.samples, message.time, message.seq);
         break;
     }
   } catch (error) {
@@ -75,23 +81,22 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
   }
 };
 
-function handleAudio(samples: Float32Array, time: number): void {
+function handleAudio(samples: Float32Array, time: number, seq: number): void {
   stats.received++;
 
-  // Slide the window along by one hop. copyWithin is a memmove, far cheaper
-  // than reallocating or rebuilding the frame each time.
-  const count = Math.min(samples.length, hopSize);
-  ring.copyWithin(0, count);
-  ring.set(samples.subarray(0, count), frameSize - count);
+  // HopWindow owns reassembly and, critically, what happens when the main
+  // thread has dropped hops to keep this thread from falling further behind:
+  // a gap discards the window so nothing is ever analysed across a splice.
+  const frame = hopWindow.push(samples, seq);
+  stats.dropped = hopWindow.dropped;
 
-  // Wait until the window is genuinely full, otherwise the first few analyses
-  // would run against zero-padded audio and read as a quiet, ambiguous chord.
-  if (hopsBuffered < Math.ceil(frameSize / hopSize)) {
-    hopsBuffered++;
+  if (!frame) {
+    // Still answer, so the sender's outstanding-work count stays exact.
+    post({ type: 'ack', seq });
     return;
   }
 
-  const observation = analyzer.analyze(ring, sampleRate, decider.signalGate());
+  const observation = analyzer.analyze(frame, sampleRate, decider.signalGate());
   const decision = decider.update(
     { chroma: observation.chroma, rms: observation.rms, now: time },
     expected,
@@ -107,6 +112,7 @@ function handleAudio(samples: Float32Array, time: number): void {
 
   post({
     type: 'decision',
+    seq,
     decision,
     pitch: observation.pitch
       ? { frequency: observation.pitch.frequency, clarity: observation.pitch.clarity }
@@ -117,6 +123,7 @@ function handleAudio(samples: Float32Array, time: number): void {
 
 function resetStats(): void {
   stats.received = 0;
+  stats.dropped = 0;
   stats.analysed = 0;
   stats.overBudget = 0;
   stats.meanMs = 0;

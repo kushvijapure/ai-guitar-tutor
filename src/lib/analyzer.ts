@@ -98,3 +98,89 @@ export class FrameAnalyzer {
 function now(): number {
   return typeof performance !== 'undefined' ? performance.now() : Date.now();
 }
+
+/**
+ * Reassembles hop-sized chunks into overlapping analysis windows.
+ *
+ * The capture worklet delivers one hop at a time; analysis needs a full
+ * frameSize window that advances by one hop. This owns the single buffer that
+ * slides along, so nothing is allocated per hop.
+ *
+ * It also owns what happens when hops go missing. The main thread drops hops
+ * when the analysis thread falls behind (see MAX_INFLIGHT_HOPS), and a window
+ * assembled across a gap is audio that was never played — a splice puts a
+ * discontinuity in the middle of the frame, which the FFT reads as broadband
+ * energy that was not there. Rather than analyse that, a gap throws the window
+ * away and refills it from scratch. Under overload the coach therefore says
+ * less; it does not say something invented.
+ *
+ * Lives here rather than in the Worker so it can be tested directly. The
+ * buffer-management bugs this guards against (off-by-one windows, splices
+ * treated as signal) are invisible from outside the Worker.
+ */
+export class HopWindow {
+  readonly frameSize: number;
+  readonly hopSize: number;
+  /** Hops needed to fill the window from empty. */
+  readonly hopsPerFrame: number;
+
+  private readonly ring: Float32Array;
+  private hopsBuffered = 0;
+  private lastSeq = -1;
+  private droppedHops = 0;
+
+  constructor(frameSize: number, hopSize: number) {
+    if (hopSize <= 0 || frameSize < hopSize) {
+      throw new Error(`bad framing: frameSize ${frameSize}, hopSize ${hopSize}`);
+    }
+    this.frameSize = frameSize;
+    this.hopSize = hopSize;
+    this.hopsPerFrame = Math.ceil(frameSize / hopSize);
+    this.ring = new Float32Array(frameSize);
+  }
+
+  /** Total hops known to have been dropped before reaching us. */
+  get dropped(): number {
+    return this.droppedHops;
+  }
+
+  /**
+   * Add one hop.
+   *
+   * @param seq Monotonic hop counter from the sender. A jump means hops were
+   *            dropped in between.
+   * @returns The full window, ready to analyse, or null while it is still
+   *          filling. The returned array is reused on every call — analyse it
+   *          before pushing again, and never retain it.
+   */
+  push(samples: Float32Array, seq: number): Float32Array | null {
+    if (this.lastSeq >= 0 && seq > this.lastSeq + 1) {
+      this.droppedHops += seq - this.lastSeq - 1;
+      this.hopsBuffered = 0;
+      this.ring.fill(0);
+    }
+    this.lastSeq = seq;
+
+    // Slide along by one hop. copyWithin is a memmove, far cheaper than
+    // reallocating or rebuilding the frame each time.
+    const count = Math.min(samples.length, this.hopSize);
+    this.ring.copyWithin(0, count);
+    this.ring.set(samples.subarray(0, count), this.frameSize - count);
+
+    // Until the window is genuinely full it is part zero-padding, which reads
+    // as a quiet ambiguous chord rather than as nothing.
+    if (this.hopsBuffered < this.hopsPerFrame) {
+      this.hopsBuffered++;
+      return null;
+    }
+    return this.ring;
+  }
+
+  /** Forget all buffered audio and sequence history. */
+  reset(): void {
+    this.hopsBuffered = 0;
+    this.lastSeq = -1;
+    this.droppedHops = 0;
+    this.ring.fill(0);
+  }
+}

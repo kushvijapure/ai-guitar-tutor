@@ -202,4 +202,10 @@ export const VOICINGS = {
   C_wrongNote: [48, 52, 55, 60, 65],
   /** Csus4 */
   Csus4: [48, 53, 55, 60],
+  /**
+   * A C shape with a Bb ringing — a muted string not quite muted, or a finger
+   * grazing the A string at the first fret. Reads as C7, which is a same-root
+   * extension of the chord that was asked for: the player has the right shape.
+   */
+  C_ringingSeventh: [48, 52, 55, 58, 60, 64],
 } as const;

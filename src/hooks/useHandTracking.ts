@@ -4,6 +4,8 @@ import {
   analyzePosture,
   LandmarkSmoother,
   resolveHandedness,
+  selectFrettingHand,
+  unassessable,
   type FingerName,
   type Landmark,
   type PostureReport,
@@ -96,6 +98,34 @@ export function useHandTracking(
     let cancelled = false;
     const teardown: Array<() => void> = [];
 
+    /**
+     * Register a resource's release function, or release it immediately if
+     * teardown has already happened.
+     *
+     * This exists because `start()` is async and React's cleanup is not. Every
+     * `await` below is a window in which the effect can be torn down: the
+     * cleanup sets `cancelled` and drains `teardown`, and only *then* does the
+     * await resolve and hand us a HandLandmarker or a MediaStream. Pushing that
+     * onto the already-drained array registers a release that will never run —
+     * the previous shape of this code leaked exactly that way, leaving the
+     * camera light on and a GPU landmarker alive after a fast start/stop or a
+     * Strict Mode double-mount.
+     *
+     * @returns false if the caller should abandon startup.
+     */
+    function own(release: () => void): boolean {
+      if (cancelled) {
+        try {
+          release();
+        } catch {
+          // Best effort — we are already unwinding.
+        }
+        return false;
+      }
+      teardown.push(release);
+      return true;
+    }
+
     const smoother = new LandmarkSmoother();
     const worldSmoother = new LandmarkSmoother();
 
@@ -125,23 +155,25 @@ export function useHandTracking(
           minHandPresenceConfidence: 0.5,
           minTrackingConfidence: 0.5,
         });
-        teardown.push(() => landmarker.close());
-        if (cancelled) return;
+        if (!own(() => landmarker.close())) return;
 
         setStatus('requesting');
         const stream = await navigator.mediaDevices.getUserMedia({
           video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
         });
-        teardown.push(() => stream.getTracks().forEach((t) => t.stop()));
-        if (cancelled) return;
+        if (!own(() => stream.getTracks().forEach((t) => t.stop()))) return;
 
         const video = videoRef.current;
         if (!video) throw new Error('Video element not mounted');
         video.srcObject = stream;
-        teardown.push(() => {
-          video.pause();
-          video.srcObject = null;
-        });
+        if (
+          !own(() => {
+            video.pause();
+            video.srcObject = null;
+          })
+        ) {
+          return;
+        }
         await video.play();
         if (cancelled) return;
 
@@ -160,7 +192,7 @@ export function useHandTracking(
             fps: recentInferences.length,
           });
         }, 1000 / UI_UPDATE_HZ);
-        teardown.push(() => clearInterval(flush));
+        if (!own(() => clearInterval(flush))) return;
 
         setStatus('running');
         loop(landmarker);
@@ -226,13 +258,15 @@ export function useHandTracking(
         };
       });
 
-      const frettingIndex = tracked.findIndex((h) => h.handedness === frettingHand);
-      const fretting = frettingIndex >= 0 ? tracked[frettingIndex] : null;
+      // Refuses to choose when two hands both claim to be the fretting hand,
+      // rather than coaching whichever happened to be detected first.
+      const selection = selectFrettingHand(tracked, frettingHand);
+      const fretting = selection.index >= 0 ? tracked[selection.index] : null;
 
       let report: PostureReport | null = null;
       if (fretting) {
         const smoothed = smoother.push(fretting.landmarks);
-        const world = result.worldLandmarks?.[frettingIndex] as Landmark[] | undefined;
+        const world = result.worldLandmarks?.[selection.index] as Landmark[] | undefined;
         const smoothedWorld = world ? worldSmoother.push(world) : null;
 
         if (smoothed) {
@@ -246,8 +280,13 @@ export function useHandTracking(
           });
         }
       } else {
+        // Tracking continuity is broken either way; restarting the warmup means
+        // the next verdict is not built on landmarks from a different hand.
         smoother.reset();
         worldSmoother.reset();
+        // Only when a hand was present but unidentifiable. A plain "fretting
+        // hand not in frame" is left as null, which the panel words differently.
+        if (selection.reason) report = unassessable(selection.reason, activeFingers);
       }
 
       pending = { hands: tracked, posture: report };

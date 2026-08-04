@@ -15,6 +15,7 @@
 
 import {
   checkExpectedChord,
+  isBenignRival,
   matchChord,
   missingTones,
   type Chroma,
@@ -30,6 +31,9 @@ import {
   MAX_PITCH_CLASSES,
   MIN_PITCH_CLASSES,
   MIN_TOP_SCORE,
+  NOISE_FLOOR_ADAPT_MAX,
+  NOISE_FLOOR_ADAPT_MIN,
+  NOISE_FLOOR_ADAPT_RATE,
   NOISE_FLOOR_MARGIN,
   SILENCE_DECAY,
   SILENCE_RESET_MS,
@@ -102,6 +106,9 @@ export class ChordDecider {
   private lastExpectedKey = '';
 
   private noiseFloor = DEFAULT_NOISE_FLOOR;
+  /** The floor as measured by the last calibration. Bounds adaptive drift. */
+  private calibratedFloor = DEFAULT_NOISE_FLOOR;
+  private calibrationPending = false;
   private calibrationStart: number | null = null;
   private calibrationSamples: number[] = [];
   private calibrated = false;
@@ -109,9 +116,23 @@ export class ChordDecider {
   /**
    * Begin (or restart) noise-floor measurement. The caller is expected to ask
    * the player not to play during this window.
+   *
+   * Deliberately takes no timestamp. The window is timed against the clock
+   * carried by the frames themselves, latched on the first frame that arrives
+   * after this call.
+   *
+   * This used to accept a `now`, and the Worker passed performance.now() while
+   * the frames carried AudioContext.currentTime * 1000. Those two clocks share
+   * no origin: performance.now() is milliseconds since page load, currentTime
+   * restarts near zero for every AudioContext. On a page that had been open for
+   * 30 seconds the elapsed time computed here went strongly negative and
+   * calibration never finished, so the coach sat in 'calibrating' and judged
+   * nothing for the whole session. Taking the start time from the same clock as
+   * the frames makes that class of mismatch impossible to reintroduce.
    */
-  beginCalibration(now: number): void {
-    this.calibrationStart = now;
+  beginCalibration(): void {
+    this.calibrationPending = true;
+    this.calibrationStart = null;
     this.calibrationSamples = [];
     this.calibrated = false;
   }
@@ -125,6 +146,17 @@ export class ChordDecider {
 
   getNoiseFloor(): number {
     return this.noiseFloor;
+  }
+
+  /**
+   * The floor as last measured by calibration, before any adaptive drift.
+   *
+   * Adaptation is bounded relative to this rather than to the current value —
+   * bounding it relative to the current value is precisely the ratchet the
+   * clamp exists to prevent.
+   */
+  getCalibratedFloor(): number {
+    return this.calibratedFloor;
   }
 
   /**
@@ -142,7 +174,9 @@ export class ChordDecider {
     const { rms, now } = frame;
 
     // ---- Calibration -----------------------------------------------------
-    if (this.calibrationStart !== null) {
+    if (this.calibrationPending) {
+      // Latch the window's origin to the frame clock, whatever that clock is.
+      if (this.calibrationStart === null) this.calibrationStart = now;
       const elapsed = now - this.calibrationStart;
       this.calibrationSamples.push(rms);
 
@@ -214,7 +248,7 @@ export class ChordDecider {
       ? this.agreeing >= STABILITY_WINDOWS
         ? 'confirmed'
         : 'listening'
-      : classify(check, scoreOk, heard);
+      : classify(check, scoreOk, heard, expected);
 
     // Missing-tone advice is only meaningful when the player is on the right
     // shape but not sounding all of it. If they played a different chord
@@ -238,6 +272,7 @@ export class ChordDecider {
 
   private handleSilence(now: number, level: number, snrDb: number): ChordDecision {
     this.agreeing = 0;
+    this.adaptNoiseFloor(level);
 
     // Decay rather than freeze. If the previous chord's chroma simply persisted,
     // the next chord would be judged against a blend of itself and its
@@ -256,12 +291,14 @@ export class ChordDecider {
 
   private finishCalibration(): void {
     const samples = this.calibrationSamples.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+    this.calibrationPending = false;
     this.calibrationStart = null;
     this.calibrationSamples = [];
     this.calibrated = true;
 
     if (samples.length === 0) {
       this.noiseFloor = DEFAULT_NOISE_FLOOR;
+      this.calibratedFloor = this.noiseFloor;
       return;
     }
 
@@ -270,6 +307,35 @@ export class ChordDecider {
     // take the single quietest frame and then treat room tone as signal.
     const idx = Math.min(samples.length - 1, Math.floor(samples.length * CALIBRATION_PERCENTILE));
     this.noiseFloor = Math.max(samples[idx], 1e-6);
+    this.calibratedFloor = this.noiseFloor;
+  }
+
+  /**
+   * Slow drift of the noise floor toward the level actually observed while
+   * nothing is being played.
+   *
+   * Only silent frames feed this, and the result is clamped to a fixed band
+   * around the calibrated floor. Both restrictions matter. Adapting on frames
+   * that cleared the gate would let a sustained note pull the floor up; and an
+   * unclamped exponential average fed by frames that are *by definition* below
+   * the gate (which sits at NOISE_FLOOR_MARGIN x the floor) can ratchet: each
+   * rise lifts the gate, which admits louder frames as "silence", which lifts
+   * the floor again, until real playing reads as silence and the coach goes
+   * deaf. The clamp makes that runaway impossible.
+   *
+   * A step change in room noise *above* the gate is not recovered here — those
+   * frames are not silence, so they never reach this path. That case needs a
+   * fresh calibration, which the UI can trigger.
+   */
+  private adaptNoiseFloor(level: number): void {
+    // A digitally silent frame is a legitimate observation of "quieter than the
+    // calibrated floor" and is allowed to pull the estimate down; the lower
+    // clamp is what stops it reaching zero.
+    if (!Number.isFinite(level) || level < 0) return;
+    const next = this.noiseFloor + (level - this.noiseFloor) * NOISE_FLOOR_ADAPT_RATE;
+    const low = this.calibratedFloor * NOISE_FLOOR_ADAPT_MIN;
+    const high = this.calibratedFloor * NOISE_FLOOR_ADAPT_MAX;
+    this.noiseFloor = Math.min(high, Math.max(low, Math.max(next, 1e-6)));
   }
 
   isCalibrated(): boolean {
@@ -282,6 +348,7 @@ function classify(
   check: ExpectedChordCheck,
   scoreOk: boolean,
   heard: ChordMatch[],
+  expected: ChordSpec,
 ): ChordStatus {
   // A flat pitch-class profile is noise, not an attempt at a chord. Saying
   // anything about the player's fingers here would be inventing information.
@@ -302,8 +369,22 @@ function classify(
 
   // Something else is on top. Only call it wrong if that something else is
   // itself a confident reading; otherwise we are just unsure.
+  //
+  // A same-root extension on top is not "something else". If the player was
+  // asked for C and a ringing Bb makes C7 the best reading, they are on the
+  // right shape and telling them they played the wrong chord is exactly the
+  // confidently-wrong coaching this module exists to avoid. Measured: a C
+  // voicing with an accidental Bb reads C7 0.923 / C 0.840, a gap of 0.083 that
+  // cleared WRONG_CHORD_MARGIN and produced a 'wrong' verdict. Such a frame
+  // still cannot be confirmed — it fails the top-match gate — so demoting it to
+  // 'ambiguous' withholds praise without inventing a fault.
   const top = heard[0];
-  if (top && top.score >= MIN_TOP_SCORE && check.score < top.score - WRONG_CHORD_MARGIN) {
+  if (
+    top &&
+    !isBenignRival(expected, top) &&
+    top.score >= MIN_TOP_SCORE &&
+    check.score < top.score - WRONG_CHORD_MARGIN
+  ) {
     return 'wrong';
   }
   return 'ambiguous';

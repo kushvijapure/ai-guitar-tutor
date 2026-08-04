@@ -21,7 +21,7 @@ import {
   MIN_RUNNER_UP_MARGIN,
   MIN_TOP_SCORE,
 } from '../src/lib/thresholds.ts';
-import { addHum, addNoise, chord, scale, VOICINGS } from '../tests/signals.ts';
+import { addHum, addNoise, addNote, chord, scale, VOICINGS } from '../tests/signals.ts';
 
 const SR = 44100;
 const analyzer = new FrameAnalyzer(FRAME_SIZE);
@@ -39,6 +39,12 @@ interface Scenario {
   signal: Float32Array;
   /** What the gates are supposed to do. */
   want: 'pass' | 'reject';
+  /**
+   * Set when the gates are already known NOT to do that, with the reason. A
+   * documented gap is not the same as a regression, and the two must not look
+   * alike in this output.
+   */
+  known?: string;
 }
 
 function sig(midis: readonly number[], options: Record<string, unknown> = {}): Float32Array {
@@ -48,6 +54,13 @@ function sig(midis: readonly number[], options: Record<string, unknown> = {}): F
     rolloff: 1,
     ...options,
   });
+}
+
+/** A correct C with an extra F added on top, at the given level. */
+function strayF(amplitude: number): Float32Array {
+  const signal = sig(VOICINGS.C);
+  addNote(signal, 65, SR, { amplitude, harmonics: 8, rolloff: 1 });
+  return signal;
 }
 
 const SCENARIOS: Scenario[] = [
@@ -75,6 +88,21 @@ const SCENARIOS: Scenario[] = [
   { label: 'C + stray F', expected: C, signal: sig(VOICINGS.C_wrongNote), want: 'reject' },
   { label: 'G played, C wanted', expected: C, signal: sig(VOICINGS.G), want: 'reject' },
   { label: 'broadband noise', expected: C, signal: addNoise(new Float32Array(FRAME_SIZE), 0.05), want: 'reject' },
+  { label: 'C + ringing Bb', expected: C, signal: sig(VOICINGS.C_ringingSeventh), want: 'reject' },
+
+  // The added-wrong-note boundary, and the legitimate case it collides with.
+  // These two sit on opposite sides of what the gates are meant to decide and
+  // yet the wrong one scores higher, which is why MIN_TOP_SCORE is not the tool
+  // for this job. Kept visible so a future threshold change has to confront it.
+  {
+    label: 'C + added F @.15',
+    expected: C,
+    signal: strayF(0.15),
+    want: 'reject',
+    known: 'scores 0.901, above the legitimate bright C at 0.896 — not separable by score',
+  },
+  { label: 'C + added F @.30', expected: C, signal: strayF(0.3), want: 'reject' },
+  { label: 'C bright (rolloff .5)', expected: C, signal: sig(VOICINGS.C, { rolloff: 0.5 }), want: 'pass' },
 ];
 
 const header = [
@@ -106,7 +134,7 @@ for (const s of SCENARIOS) {
   const best = matchChord(observation.chroma, 1)[0];
   const passes = check.passes && check.score >= MIN_TOP_SCORE;
   const asExpected = passes === (s.want === 'pass');
-  if (!asExpected) surprises++;
+  if (!asExpected && !s.known) surprises++;
 
   console.log(
     [
@@ -117,7 +145,8 @@ for (const s of SCENARIOS) {
       (check.margin === Infinity ? 'inf' : check.margin.toFixed(3)).padEnd(7),
       String(check.pitchClassCount).padEnd(3),
       check.hasCharacteristicTone ? ' Y ' : ' n ',
-      (passes ? 'PASS' : 'rej ') + (asExpected ? '' : '  <-- UNEXPECTED'),
+      (passes ? 'PASS' : 'rej ') +
+        (asExpected ? '' : s.known ? '  <-- KNOWN GAP' : '  <-- UNEXPECTED'),
       best ? `${best.name}:${best.score.toFixed(3)}` : '-',
     ].join('  '),
   );
@@ -134,4 +163,13 @@ const margins = passing.flatMap((c) => (c && Number.isFinite(c.margin) ? [c.marg
 console.log('\nHeadroom on legitimate chords (want=pass):');
 console.log(`  lowest score  ${Math.min(...scores).toFixed(3)}  vs MIN_TOP_SCORE ${MIN_TOP_SCORE}`);
 console.log(`  lowest margin ${Math.min(...margins).toFixed(3)}  vs MIN_RUNNER_UP_MARGIN ${MIN_RUNNER_UP_MARGIN}`);
-console.log(surprises === 0 ? '\nAll scenarios behaved as intended.\n' : `\n${surprises} scenario(s) did not.\n`);
+const known = SCENARIOS.filter((s) => s.known);
+if (known.length > 0) {
+  console.log('\nKnown gaps (documented, not regressions):');
+  for (const s of known) console.log(`  ${s.label}: ${s.known}`);
+}
+console.log(
+  surprises === 0
+    ? '\nAll scenarios behaved as intended, known gaps aside.\n'
+    : `\n${surprises} scenario(s) did not.\n`,
+);
