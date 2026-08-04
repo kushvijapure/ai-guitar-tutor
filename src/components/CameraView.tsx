@@ -11,43 +11,50 @@ const CONNECTIONS: Array<[number, number]> = [
   [0, 17],                                   // palm base
 ];
 
+const FINGERTIPS = new Set([4, 8, 12, 16, 20]);
+
 interface Props {
   videoRef: RefObject<HTMLVideoElement | null>;
   hands: TrackedHand[];
   /** Which hand to highlight as the fretting hand. */
   frettingHand: string;
+  /** Whether the preview is mirrored on screen; the overlay must match. */
+  mirrored: boolean;
 }
 
-export function CameraView({ videoRef, hands, frettingHand }: Props) {
+export function CameraView({ videoRef, hands, frettingHand, mirrored }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    const video = videoRef.current;
-    if (!canvas || !video) return;
+    if (!canvas) return;
 
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const { clientWidth: width, clientHeight: height } = canvas;
-    if (canvas.width !== width || canvas.height !== height) {
-      canvas.width = width;
-      canvas.height = height;
+    // Match the backing store to the CSS size and device pixel ratio, or the
+    // overlay is blurry on a high-DPI screen and misaligned after a resize.
+    const ratio = window.devicePixelRatio || 1;
+    const width = canvas.clientWidth;
+    const height = canvas.clientHeight;
+    if (canvas.width !== width * ratio || canvas.height !== height * ratio) {
+      canvas.width = width * ratio;
+      canvas.height = height * ratio;
     }
-
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     ctx.clearRect(0, 0, width, height);
 
     for (const hand of hands) {
       const isFretting = hand.handedness === frettingHand;
-      const stroke = isFretting ? '#5eead4' : 'rgba(148, 163, 184, 0.45)';
-      const fill = isFretting ? '#f0fdfa' : 'rgba(148, 163, 184, 0.6)';
+      ctx.strokeStyle = isFretting ? '#5eead4' : 'rgba(148, 163, 184, 0.45)';
+      ctx.fillStyle = isFretting ? '#f0fdfa' : 'rgba(148, 163, 184, 0.6)';
+      ctx.lineWidth = isFretting ? 3 : 2;
 
-      // Video is mirrored via CSS, so mirror the landmarks to match.
-      const px = (i: number) => (1 - hand.landmarks[i].x) * width;
+      // Landmarks are in the raw (unmirrored) frame's coordinates. Flip them
+      // here when the preview is mirrored so the skeleton sits on the hand.
+      const px = (i: number) => (mirrored ? 1 - hand.landmarks[i].x : hand.landmarks[i].x) * width;
       const py = (i: number) => hand.landmarks[i].y * height;
 
-      ctx.lineWidth = isFretting ? 3 : 2;
-      ctx.strokeStyle = stroke;
       ctx.beginPath();
       for (const [a, b] of CONNECTIONS) {
         ctx.moveTo(px(a), py(a));
@@ -55,21 +62,24 @@ export function CameraView({ videoRef, hands, frettingHand }: Props) {
       }
       ctx.stroke();
 
-      ctx.fillStyle = fill;
       for (let i = 0; i < hand.landmarks.length; i++) {
-        // Fingertips slightly larger — they're what the coaching cues talk about.
-        const isTip = [4, 8, 12, 16, 20].includes(i);
         ctx.beginPath();
-        ctx.arc(px(i), py(i), isTip && isFretting ? 6 : 3.5, 0, Math.PI * 2);
+        ctx.arc(px(i), py(i), FINGERTIPS.has(i) && isFretting ? 6 : 3.5, 0, Math.PI * 2);
         ctx.fill();
       }
     }
-  }, [hands, videoRef, frettingHand]);
+  }, [hands, frettingHand, mirrored]);
 
   return (
     <div className="camera-view">
-      <video ref={videoRef} playsInline muted />
-      <canvas ref={canvasRef} />
+      <video
+        ref={videoRef}
+        playsInline
+        muted
+        className={mirrored ? 'mirrored' : undefined}
+        aria-label="Camera preview of your fretting hand"
+      />
+      <canvas ref={canvasRef} aria-hidden="true" />
     </div>
   );
 }
