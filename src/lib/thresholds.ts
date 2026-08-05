@@ -38,8 +38,13 @@ export const HOP_SIZE = 2048;
  * Dropping is safe because the Worker treats a gap in the sequence as a
  * discontinuity and refills its whole window before analysing again, so no
  * decision is ever computed from spliced audio. Normal operation sits at 0-1
- * outstanding (analysis costs ~1 ms against a 46 ms budget), so this only
- * engages under genuine overload.
+ * outstanding, so this only engages under genuine overload.
+ *
+ * Cost, measured in Chrome at 48 kHz rather than estimated: mean 4.43 ms per
+ * analysis, worst 45 ms, against a 42.7 ms hop budget — one frame over budget,
+ * the first, while cold. Comfortable, but roughly 4x the ~1 ms this comment
+ * previously claimed. That figure came from a synthetic load under automated
+ * Chrome, so re-measure on target hardware rather than trusting it.
  */
 export const MAX_INFLIGHT_HOPS = 6;
 
@@ -158,10 +163,20 @@ export const SILENCE_RESET_MS = 400;
  * Deliberately NOT raised to close the added-wrong-note gap. A correct C with
  * an extra F added at half the chord's level scores 0.901 while a legitimate
  * bright C (rolloff 0.5) scores 0.896 — the wrong reading scores higher, so
- * every value that rejects the first rejects the second too. Cosine similarity
- * cannot separate those; see tests/chords.test.ts, "rejects a stray F once it
- * is as prominent as the chord tones", for the measurements and for what a
- * real fix would need.
+ * every value that rejects the first rejects the second too.
+ *
+ * Precisely: NO THRESHOLD ON THIS SCORE separates those two cases. That is a
+ * narrower claim than "they cannot be separated", and the distinction matters
+ * to whoever picks this up next. A different discriminant plausibly could —
+ * review suggested harmonic explicability, since F is not a low-order harmonic
+ * of C, E or G, whereas a bright C's extra pitch classes are exactly the
+ * low-order harmonics of its own chord tones. Pitch-class count does not help
+ * (both show 5). That is unbuilt and unvalidated: it needs the real-audio
+ * corpus described in the README, not synthetic headroom, because real
+ * inharmonicity and room modes would drive false rejects.
+ *
+ * See tests/chords.test.ts, "rejects a stray F once it is as prominent as the
+ * chord tones", for the measurements.
  */
 export const MIN_TOP_SCORE = 0.86;
 

@@ -61,11 +61,18 @@ const EMPTY_STATS: TrackingStats = {
   fps: 0,
 };
 
+/**
+ * Deliberately ignores `frames` and `skipped`. Both are raw animation-frame
+ * counters incremented before the rate cap, so they advance several times
+ * between two 83 ms flush ticks and would make this comparison always false —
+ * which is exactly the idle re-render the throttle exists to prevent. The
+ * consequence is that those two counters can lag by a tick in the diagnostics
+ * panel, which is the right trade for a number that changes every 16 ms by
+ * construction.
+ */
 function statsEqual(a: TrackingStats, b: TrackingStats): boolean {
   return (
-    a.frames === b.frames &&
     a.inferences === b.inferences &&
-    a.skipped === b.skipped &&
     a.meanInferenceMs === b.meanInferenceMs &&
     a.worstInferenceMs === b.worstInferenceMs &&
     a.fps === b.fps
@@ -79,13 +86,28 @@ const MIDDLE_MCP = 9;
  * A wrist that moves further than this many hand-lengths between consecutive
  * inferences did not move — it is a different hand.
  *
- * At HAND_TRACKING_FPS the gap between inferences is ~50 ms. A real fretting
- * hand shifting position travels a fraction of its own length in that time;
- * one whole length is already generous. Set loosely on purpose: a false trigger
- * costs POSTURE_WARMUP_FRAMES of "unable to assess" (~250 ms), while a missed
- * one costs a confident verdict about a hand that is not there.
+ * This is the last line of defence. When the frettingHand setting and the
+ * detection index are both unchanged, nothing else distinguishes two hands, so
+ * anything this permits gets blended into the smoother and can be coached.
+ *
+ * Set TIGHT on purpose, because the costs are asymmetric: a false trigger costs
+ * POSTURE_WARMUP_FRAMES of "unable to assess" (~250 ms), while a miss costs a
+ * confident verdict about a hand that is not there — the one failure this app
+ * exists to prevent. An earlier value of 1.0 was described as deliberately
+ * generous, which contradicted that reasoning; review measured the original
+ * false accept reproducing bit-for-bit at any separation below it.
+ *
+ * At HAND_TRACKING_FPS the gap between inferences is ~50 ms, in which a real
+ * fretting hand shifting position travels a fraction of its own length. The
+ * fastest synthetic shift in the test fixtures sits at 0.33, so 0.5 keeps
+ * legitimate motion clear while halving the window in which two hands can be
+ * confused.
+ *
+ * UNVALIDATED against a real hand at 20 fps. If this proves too tight the
+ * symptom is occasional spurious "unable to assess" during fast position
+ * changes, which fails in the safe direction.
  */
-const HAND_IDENTITY_JUMP_RATIO = 1;
+const HAND_IDENTITY_JUMP_RATIO = 0.5;
 
 /** Which hand the smoothers currently hold history for. */
 interface HandIdentity {
