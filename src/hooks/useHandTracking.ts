@@ -6,6 +6,7 @@ import {
   resolveHandedness,
   selectFrettingHand,
   unassessable,
+  WRIST,
   type FingerName,
   type Landmark,
   type PostureReport,
@@ -59,6 +60,175 @@ const EMPTY_STATS: TrackingStats = {
   worstInferenceMs: 0,
   fps: 0,
 };
+
+function statsEqual(a: TrackingStats, b: TrackingStats): boolean {
+  return (
+    a.frames === b.frames &&
+    a.inferences === b.inferences &&
+    a.skipped === b.skipped &&
+    a.meanInferenceMs === b.meanInferenceMs &&
+    a.worstInferenceMs === b.worstInferenceMs &&
+    a.fps === b.fps
+  );
+}
+
+/** Middle-finger MCP. Not exported by posture.ts, and only needed for scale here. */
+const MIDDLE_MCP = 9;
+
+/**
+ * A wrist that moves further than this many hand-lengths between consecutive
+ * inferences did not move — it is a different hand.
+ *
+ * At HAND_TRACKING_FPS the gap between inferences is ~50 ms. A real fretting
+ * hand shifting position travels a fraction of its own length in that time;
+ * one whole length is already generous. Set loosely on purpose: a false trigger
+ * costs POSTURE_WARMUP_FRAMES of "unable to assess" (~250 ms), while a missed
+ * one costs a confident verdict about a hand that is not there.
+ */
+const HAND_IDENTITY_JUMP_RATIO = 1;
+
+/** Which hand the smoothers currently hold history for. */
+interface HandIdentity {
+  frettingHand: string;
+  index: number;
+}
+
+export interface TrackedFrame {
+  landmarks: Landmark[];
+  worldLandmarks?: Landmark[];
+  /** Frames of history behind BOTH coordinate spaces being returned. */
+  framesObserved: number;
+}
+
+export interface TrackInput {
+  /** The player's fretting-hand setting on this frame. */
+  frettingHand: string;
+  /** Index of the selected hand within this frame's detection list. */
+  index: number;
+  landmarks: Landmark[];
+  worldLandmarks?: Landmark[];
+  /** Frame width / height, needed to compare distances fairly. */
+  aspect: number;
+}
+
+/**
+ * Smoothing for whichever hand is currently the fretting hand, with a hard rule:
+ * history is never carried across a change of hand.
+ *
+ * Resetting on dropout (no hand selected) is the easy half, and the previous
+ * version did only that. The dangerous half is when a hand stays *selected* but
+ * stops being the same hand. The landmark count is identical, so the smoother
+ * happily blends the two and framesObserved() keeps climbing, which means the
+ * warmup gate never re-arms and analyzePosture issues a confident verdict about
+ * a hand that no longer exists. Measured: about two frames (~100 ms) of "your
+ * fingers look well arched" about fingers that are lying flat.
+ *
+ * Two ways it happens, both reachable:
+ *   1. The player changes the fretting-hand setting mid-session.
+ *   2. MediaPipe trades its two handedness labels between frames — the same
+ *      occlusion degradation that motivated refusing when both hands share a
+ *      label. That fix covered two hands claiming one label; it did not cover
+ *      the labels swapping places.
+ *
+ * Identity is therefore checked three ways: the setting, the index within the
+ * detection list, and spatial continuity of the wrist. The last one is the
+ * backstop for a swap that happens to preserve the index.
+ */
+export class FrettingHandTracker {
+  private readonly smoother = new LandmarkSmoother();
+  private readonly worldSmoother = new LandmarkSmoother();
+  private identity: HandIdentity | null = null;
+  private lastWrist: Landmark | null = null;
+
+  /** Drop all history, re-arming the warmup gate. */
+  reset(): void {
+    this.smoother.reset();
+    this.worldSmoother.reset();
+    this.identity = null;
+    this.lastWrist = null;
+  }
+
+  /**
+   * @returns Smoothed landmarks for this frame, or null if there is nothing to
+   *          smooth. A frame that starts a new identity comes back with
+   *          framesObserved === 1, which the warmup gate rejects.
+   */
+  track(input: TrackInput): TrackedFrame | null {
+    const { frettingHand, index, landmarks, worldLandmarks, aspect } = input;
+    if (!landmarks || landmarks.length === 0) {
+      this.reset();
+      return null;
+    }
+
+    if (!this.isSameHand(frettingHand, index, landmarks, aspect)) {
+      // Not a continuation. Anything carried over would be a blend of two hands.
+      this.smoother.reset();
+      this.worldSmoother.reset();
+    }
+
+    const smoothed = this.smoother.push(landmarks);
+    if (!smoothed) {
+      this.reset();
+      return null;
+    }
+
+    // World landmarks are optional per frame. When they vanish the world
+    // smoother must be dropped too, or it holds stale history that pairs a
+    // satisfied (image-derived) warmup gate with barely-smoothed world
+    // coordinates — and world coordinates are what the angles are measured from.
+    let smoothedWorld: Landmark[] | null = null;
+    if (worldLandmarks && worldLandmarks.length > 0) {
+      smoothedWorld = this.worldSmoother.push(worldLandmarks);
+    } else {
+      this.worldSmoother.reset();
+    }
+
+    this.identity = { frettingHand, index };
+    this.lastWrist = { ...landmarks[WRIST] };
+
+    // The gate must reflect the space the angles actually come from, so take
+    // the shorter history of the two rather than assuming they advance together.
+    const framesObserved = smoothedWorld
+      ? Math.min(this.smoother.framesObserved(), this.worldSmoother.framesObserved())
+      : this.smoother.framesObserved();
+
+    return {
+      landmarks: smoothed,
+      worldLandmarks: smoothedWorld ?? undefined,
+      framesObserved,
+    };
+  }
+
+  private isSameHand(
+    frettingHand: string,
+    index: number,
+    landmarks: Landmark[],
+    aspect: number,
+  ): boolean {
+    if (!this.identity || !this.lastWrist) return false;
+    if (this.identity.frettingHand !== frettingHand) return false;
+    if (this.identity.index !== index) return false;
+
+    const wrist = landmarks[WRIST];
+    const mcp = landmarks[MIDDLE_MCP];
+    if (!wrist || !mcp) return false;
+
+    // Both distances must be isotropic before they can be compared. Landmark y
+    // is normalized by frame height and x by frame width, so on a 16:9 camera a
+    // vertically-oriented hand measures ~1.8x longer than the same hand lying
+    // horizontally. Comparing a mostly-horizontal jump against a mostly-vertical
+    // hand in raw units silently loosens this guard by that factor.
+    const yScale = aspect > 0 ? 1 / aspect : 1;
+    const handScale = Math.hypot(wrist.x - mcp.x, (wrist.y - mcp.y) * yScale);
+    if (!(handScale > 0)) return false;
+
+    const jump = Math.hypot(
+      wrist.x - this.lastWrist.x,
+      (wrist.y - this.lastWrist.y) * yScale,
+    );
+    return jump <= handScale * HAND_IDENTITY_JUMP_RATIO;
+  }
+}
 
 interface Options {
   /** Fingers the current chord frets — posture only judges these. */
@@ -126,8 +296,23 @@ export function useHandTracking(
       return true;
     }
 
-    const smoother = new LandmarkSmoother();
-    const worldSmoother = new LandmarkSmoother();
+    /**
+     * Run every registered release, exactly once.
+     *
+     * Drains the array as it goes so it is safe to call twice — the failure
+     * path and the cleanup path both call it, and either may come first.
+     */
+    function releaseAll(): void {
+      for (const release of teardown.splice(0).reverse()) {
+        try {
+          release();
+        } catch {
+          // Keep tearing down even if one step fails.
+        }
+      }
+    }
+
+    const tracker = new FrettingHandTracker();
 
     let rafId: number | null = null;
     let lastVideoTime = -1;
@@ -139,6 +324,9 @@ export function useHandTracking(
 
     /** Newest result, drained into React on a fixed cadence. */
     let pending: { hands: TrackedHand[]; posture: PostureReport | null } | null = null;
+
+    /** Last stats published to React, so unchanged ones can be skipped. */
+    let lastStats: TrackingStats = EMPTY_STATS;
 
     async function start() {
       try {
@@ -183,20 +371,35 @@ export function useHandTracking(
             setPosture(pending.posture);
             pending = null;
           }
-          setStats({
+          // Only publish stats that actually moved. Setting a fresh object every
+          // tick re-rendered the whole app 12x/s while nothing was happening,
+          // on top of the audio hook's own flush — which defeats half the point
+          // of throttling in the first place.
+          const next: TrackingStats = {
             frames: counters.frames,
             inferences: counters.inferences,
             skipped: counters.skipped,
             meanInferenceMs: counters.inferences ? counters.totalMs / counters.inferences : 0,
             worstInferenceMs: counters.worstMs,
             fps: recentInferences.length,
-          });
+          };
+          if (!statsEqual(next, lastStats)) {
+            lastStats = next;
+            setStats(next);
+          }
         }, 1000 / UI_UPDATE_HZ);
         if (!own(() => clearInterval(flush))) return;
 
         setStatus('running');
         loop(landmarker);
       } catch (error) {
+        // Release whatever startup got as far as acquiring. Reaching here after
+        // HandLandmarker.createFromOptions succeeded — permission denied, no
+        // camera, i.e. the advertised audio-only path — otherwise held the
+        // landmarker, its running GL graph and the ~7.8 MB model for the whole
+        // session. Stop would eventually free them, but the session never
+        // needed them at all.
+        releaseAll();
         if (cancelled) return;
         setStatus('error');
         setFailure(describeMediaError(error, 'camera'));
@@ -263,27 +466,36 @@ export function useHandTracking(
       const selection = selectFrettingHand(tracked, frettingHand);
       const fretting = selection.index >= 0 ? tracked[selection.index] : null;
 
+      const aspect = video.videoWidth / video.videoHeight || 16 / 9;
+
       let report: PostureReport | null = null;
       if (fretting) {
-        const smoothed = smoother.push(fretting.landmarks);
-        const world = result.worldLandmarks?.[selection.index] as Landmark[] | undefined;
-        const smoothedWorld = world ? worldSmoother.push(world) : null;
+        // The tracker restarts warmup by itself if this is not the same hand it
+        // saw last frame, so a mid-session change of fretting hand — or a
+        // MediaPipe label swap — reports 'unreliable' instead of a verdict
+        // blended from two different hands.
+        const frame = tracker.track({
+          frettingHand,
+          index: selection.index,
+          landmarks: fretting.landmarks,
+          worldLandmarks: result.worldLandmarks?.[selection.index] as Landmark[] | undefined,
+          aspect,
+        });
 
-        if (smoothed) {
+        if (frame) {
           report = analyzePosture({
-            landmarks: smoothed,
-            worldLandmarks: smoothedWorld ?? undefined,
-            aspect: video.videoWidth / video.videoHeight || 16 / 9,
+            landmarks: frame.landmarks,
+            worldLandmarks: frame.worldLandmarks,
+            aspect,
             confidence: fretting.confidence,
             activeFingers,
-            framesObserved: smoother.framesObserved(),
+            framesObserved: frame.framesObserved,
           });
         }
       } else {
         // Tracking continuity is broken either way; restarting the warmup means
         // the next verdict is not built on landmarks from a different hand.
-        smoother.reset();
-        worldSmoother.reset();
+        tracker.reset();
         // Only when a hand was present but unidentifiable. A plain "fretting
         // hand not in frame" is left as null, which the panel words differently.
         if (selection.reason) report = unassessable(selection.reason, activeFingers);
@@ -297,16 +509,10 @@ export function useHandTracking(
     return () => {
       cancelled = true;
       if (rafId !== null) cancelAnimationFrame(rafId);
-      for (const release of teardown.reverse()) {
-        try {
-          release();
-        } catch {
-          // Keep tearing down even if one step fails.
-        }
-      }
-      smoother.reset();
-      worldSmoother.reset();
+      releaseAll();
+      tracker.reset();
       pending = null;
+      lastStats = EMPTY_STATS;
       setHands([]);
       setPosture(null);
       setStatus('idle');

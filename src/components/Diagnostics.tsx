@@ -55,6 +55,15 @@ export function Diagnostics({ audio, video, sampleRate, onClose }: Props) {
             <th scope="row">Over budget</th>
             <td>{audio ? audio.overBudget : '—'}</td>
           </tr>
+          {/* Unlike video "skipped", a dropped hop is never deliberate: it means
+              the worker was MAX_INFLIGHT_HOPS behind and audio was discarded.
+              The decision path is unaffected — the worker refills its window
+              rather than analysing across the splice — but a non-zero count in
+              steady state is the signal that this machine cannot keep up. */}
+          <tr className={audio && audio.dropped > 0 ? 'warn-row' : undefined}>
+            <th scope="row">Hops dropped</th>
+            <td>{audio ? audio.dropped : '—'}</td>
+          </tr>
 
           <tr className="diag-section">
             <th colSpan={2}>Video (main thread)</th>

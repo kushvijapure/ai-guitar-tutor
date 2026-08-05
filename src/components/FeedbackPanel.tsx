@@ -1,28 +1,41 @@
 import type { Cue, PostureReport } from '../lib/posture';
 
+/**
+ * Why the camera is not currently producing landmarks. These are not
+ * interchangeable: 'starting' is transient and needs no action, whereas
+ * 'unavailable' is the audio-only fallback and does. Collapsing them into one
+ * boolean made the panel announce "running in audio-only mode" before the
+ * session had started and while the camera was still loading — contradicting
+ * the camera chip, which said "Loading hand model…" at the same moment.
+ */
+export type CameraPhase = 'idle' | 'starting' | 'running' | 'unavailable';
+
 interface Props {
   posture: PostureReport | null;
   handDetected: boolean;
-  /** False when the camera is off or unavailable — the panel explains why. */
-  videoActive: boolean;
+  cameraPhase: CameraPhase;
 }
 
 /**
  * Fretting-hand feedback.
  *
- * Three distinct empty states, because they need different actions from the
- * player: no camera at all, camera on but no hand in frame, and hand in frame
- * but not measurable. The prototype collapsed the last two into "hand not in
- * frame", which was wrong advice for a hand that was in frame but foreshortened.
+ * Distinct empty states, because they need different actions from the player:
+ * session not started, camera still coming up, no camera at all, camera on but
+ * no hand in frame, and hand in frame but not measurable. The prototype
+ * collapsed the last two into "hand not in frame", which was wrong advice for a
+ * hand that was in frame but foreshortened.
  */
-export function FeedbackPanel({ posture, handDetected, videoActive }: Props) {
-  if (!videoActive) {
+export function FeedbackPanel({ posture, handDetected, cameraPhase }: Props) {
+  if (cameraPhase !== 'running') {
     return (
       <section className="panel" aria-labelledby="hand-heading">
         <h3 id="hand-heading">Fretting hand</h3>
         <p className="muted">
-          Camera off — running in audio-only mode. Chord coaching still works; hand-shape
-          coaching needs video.
+          {cameraPhase === 'idle'
+            ? 'Start a session to get hand-shape coaching.'
+            : cameraPhase === 'starting'
+              ? 'Starting the camera…'
+              : 'Camera off — running in audio-only mode. Chord coaching still works; hand-shape coaching needs video.'}
         </p>
       </section>
     );

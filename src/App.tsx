@@ -9,7 +9,7 @@ import { OPEN_CHORDS_LESSON } from './lessons/openChords';
 import { CameraView } from './components/CameraView';
 import { ChordStatusPanel } from './components/ChordStatusPanel';
 import { Diagnostics } from './components/Diagnostics';
-import { FeedbackPanel } from './components/FeedbackPanel';
+import { FeedbackPanel, type CameraPhase } from './components/FeedbackPanel';
 import { SessionIntro } from './components/SessionIntro';
 import './App.css';
 
@@ -53,8 +53,17 @@ export default function App() {
 
   // Audio-only mode: the camera failing must not stop the session. Chord
   // coaching is the part that actually judges correctness, and it is unaffected.
-  const audioOnly = !cameraEnabled || video.status === 'error';
   const fretting = video.hands.find((h) => h.handedness === frettingHand) ?? null;
+
+  // Distinguishes "not started yet" and "still coming up" from the audio-only
+  // fallback, so the hand panel cannot announce a fallback that has not happened.
+  const cameraPhase: CameraPhase = !active
+    ? 'idle'
+    : !cameraEnabled || video.status === 'error'
+      ? 'unavailable'
+      : video.status === 'running'
+        ? 'running'
+        : 'starting';
 
   // ---- Hold timer ---------------------------------------------------------
   // Runs only while the decision is 'confirmed'. Because confirmation already
@@ -137,9 +146,13 @@ export default function App() {
 
           <label className="hand-toggle">
             Fretting hand
+            {/* Locked during a session: changing the selection mid-session
+                switches which hand is tracked, which contaminates the landmark
+                smoother with two different hands. See useHandTracking. */}
             <select
               value={frettingHand}
               onChange={(e) => setFrettingHand(e.target.value)}
+              disabled={active}
             >
               <option value="Left">Left</option>
               <option value="Right">Right</option>
@@ -279,7 +292,7 @@ export default function App() {
           <FeedbackPanel
             posture={video.posture}
             handDetected={Boolean(fretting)}
-            videoActive={active && !audioOnly && video.status === 'running'}
+            cameraPhase={cameraPhase}
           />
 
           <section className="panel" aria-labelledby="tuner-heading">
