@@ -1,0 +1,176 @@
+<!doctype html>
+<!--
+  Source for docs/assets/social-preview.png (1280x640).
+
+  Uses the application's own design tokens, copied verbatim from src/App.css,
+  so the preview carries the real visual identity rather than an invented one.
+  No third-party imagery. Render at exactly 1280x640 and export as PNG.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AI Guitar Tutor — social preview</title>
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel: #141b23;
+    --panel-border: #223040;
+    --text: #e6edf3;
+    --muted: #8b9bb0;
+    --accent: #5eead4;
+    --bad: #f87171;
+    --good: #4ade80;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: var(--bg); }
+  body { overflow: hidden; }
+
+  #card {
+    width: 1280px;
+    height: 640px;
+    transform-origin: top left;
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+    padding: 68px 72px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    position: relative;
+    overflow: hidden;
+  }
+
+  /* soft accent wash, echoing the app's single accent colour */
+  #card::after {
+    content: '';
+    position: absolute;
+    right: -180px; top: -180px;
+    width: 620px; height: 620px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(94,234,212,0.10) 0%, rgba(94,234,212,0) 70%);
+  }
+
+  h1 {
+    font-size: 74px;
+    letter-spacing: -2.2px;
+    font-weight: 700;
+    line-height: 1.02;
+  }
+  .accent { color: var(--accent); }
+
+  .tagline {
+    margin-top: 22px;
+    font-size: 27px;
+    line-height: 1.42;
+    color: var(--muted);
+    max-width: 780px;
+    font-weight: 400;
+  }
+
+  .states { display: flex; gap: 14px; margin-top: 8px; flex-wrap: wrap; }
+  .chip {
+    border: 1px solid var(--panel-border);
+    background: var(--panel);
+    border-radius: 999px;
+    padding: 11px 22px;
+    font-size: 20px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .dot { width: 10px; height: 10px; border-radius: 50%; }
+
+  footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    font-size: 20px;
+    color: var(--muted);
+    position: relative;
+    z-index: 2;
+  }
+  .stack { display: flex; gap: 26px; }
+  .stack span { color: var(--muted); }
+
+  .beta {
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 17px;
+    letter-spacing: 1.4px;
+    text-transform: uppercase;
+  }
+
+  /* the app's own chord-diagram motif (open Em), drawn the way ChordDiagram does */
+  #frets {
+    position: absolute;
+    right: 78px; top: 150px;
+    z-index: 2;
+  }
+</style>
+</head>
+<body>
+<div id="card">
+  <div>
+    <h1>AI Guitar<br>Tutor<span class="accent">.</span></h1>
+    <p class="tagline">
+      A privacy-first browser coach that listens to your chords, watches your
+      fretting hand &mdash; and refuses to guess when the evidence is unreliable.
+    </p>
+  </div>
+
+  <svg id="frets" width="210" height="250" viewBox="0 0 210 250" aria-hidden="true">
+    <!-- nut -->
+    <rect x="20" y="26" width="170" height="7" rx="2" fill="#8b9bb0"/>
+    <!-- strings -->
+    <g stroke="#223040" stroke-width="2.5">
+      <line x1="20"  y1="30" x2="20"  y2="240"/>
+      <line x1="54"  y1="30" x2="54"  y2="240"/>
+      <line x1="88"  y1="30" x2="88"  y2="240"/>
+      <line x1="122" y1="30" x2="122" y2="240"/>
+      <line x1="156" y1="30" x2="156" y2="240"/>
+      <line x1="190" y1="30" x2="190" y2="240"/>
+    </g>
+    <!-- frets -->
+    <g stroke="#223040" stroke-width="2.5">
+      <line x1="20" y1="82"  x2="190" y2="82"/>
+      <line x1="20" y1="134" x2="190" y2="134"/>
+      <line x1="20" y1="186" x2="190" y2="186"/>
+      <line x1="20" y1="238" x2="190" y2="238"/>
+    </g>
+    <!-- open Em: 2nd fret on A and D strings -->
+    <circle cx="54" cy="108" r="15" fill="#5eead4"/>
+    <circle cx="88" cy="108" r="15" fill="#5eead4"/>
+    <text x="54" y="115" font-size="17" font-weight="700" text-anchor="middle"
+          fill="#05221d" font-family="ui-sans-serif, system-ui, sans-serif">2</text>
+    <text x="88" y="115" font-size="17" font-weight="700" text-anchor="middle"
+          fill="#05221d" font-family="ui-sans-serif, system-ui, sans-serif">3</text>
+  </svg>
+
+  <div class="states">
+    <div class="chip"><span class="dot" style="background:var(--good)"></span>Chord confirmed</div>
+    <div class="chip"><span class="dot" style="background:var(--bad)"></span>That is a different chord</div>
+    <div class="chip"><span class="dot" style="background:var(--muted)"></span>Can&rsquo;t tell yet</div>
+  </div>
+
+  <footer>
+    <div class="stack">
+      <span>React + TypeScript</span>
+      <span>Web Audio DSP</span>
+      <span>MediaPipe</span>
+      <span>No backend</span>
+    </div>
+    <div class="beta">Beta</div>
+  </footer>
+</div>
+
+<script>
+  // Scale the fixed 1280x640 card to fill the viewport width exactly, so a
+  // viewport screenshot can be cropped to the top 2:1 region and resampled
+  // back to 1280x640 without distortion.
+  const card = document.getElementById('card');
+  card.style.transform = 'scale(' + (window.innerWidth / 1280) + ')';
+</script>
+</body>
+</html>

@@ -29,7 +29,7 @@ scripts/measure-gates.mjs
 scripts/bench.mjs
 
 # staged by scripts/fetch-assets.mjs — see src/lib/mediapipeAssets.ts.
-# The wasm is a copy of an npm dependency; the model is a ~7.5 MB Google binary
+# The wasm is a copy of an npm dependency; the model is a ~7.8 MB Google binary
 # whose redistribution is the repo owner's call, so neither is committed.
 public/mediapipe/
 public/models/
