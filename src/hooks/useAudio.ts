@@ -4,6 +4,7 @@ import type { ChordDecision } from '../lib/chordDecision';
 import type { ChordSpec } from '../lib/chroma';
 import { describeMediaError, type MediaFailure } from '../lib/mediaErrors';
 import { FRAME_SIZE, HOP_SIZE, MAX_INFLIGHT_HOPS, UI_UPDATE_HZ } from '../lib/thresholds';
+import { HopDispatcher } from '../audio/backpressure';
 
 /**
  * Microphone capture and chord analysis.
@@ -149,20 +150,15 @@ export function useAudio(enabled: boolean, expected: ChordSpec) {
         worker.postMessage({ type: 'expected', chord: expectedRef.current } satisfies ToWorker);
         worker.postMessage({ type: 'calibrate' } satisfies ToWorker);
 
-        // Backpressure. postMessage queues without bound, so if the Worker ever
-        // falls behind — GC, a throttled tab, a slow machine — hops pile up at
-        // 8 KB and 46 ms of latency each and the coaching drifts further and
-        // further behind what the player is actually doing. Track how many hops
-        // are outstanding and stop sending once the Worker is too far back.
-        let nextSeq = 0;
-        let lastAnswered = -1;
+        // Backpressure. See HopDispatcher for why this needs two counters and
+        // not one: the capture sequence must advance for discarded hops so the
+        // Worker can see the hole, while the in-flight count must not, so the
+        // queue stays bounded. Fresh per session, so a restart starts clean.
+        const dispatcher = new HopDispatcher(MAX_INFLIGHT_HOPS);
+        teardown.push(() => dispatcher.reset());
 
         worker.onmessage = (event: MessageEvent<FromWorker>) => {
           const message = event.data;
-          if (message.type === 'ack') {
-            lastAnswered = message.seq;
-            return;
-          }
           if (message.type === 'error') {
             setStatus('error');
             setFailure({
@@ -172,13 +168,20 @@ export function useAudio(enabled: boolean, expected: ChordSpec) {
             });
             return;
           }
-          lastAnswered = message.seq;
+          // Every forwarded hop is answered exactly once, by an 'ack' if it only
+          // filled the window or a 'decision' if it was analysed.
+          dispatcher.answered(message.seq);
+          if (message.type === 'ack') return;
+
           // Overwrite rather than queue: if React is behind, the newest reading
           // is the only one worth showing.
           pending.current = {
             decision: message.decision,
             pitch: message.pitch,
-            stats: message.stats,
+            // The Worker infers drops from gaps in the sequence, which cannot
+            // see hops discarded before the first forward or after the last.
+            // The sender counted them where they happened, so report that.
+            stats: { ...message.stats, dropped: dispatcher.discarded },
           };
         };
 
@@ -199,15 +202,18 @@ export function useAudio(enabled: boolean, expected: ChordSpec) {
         capture.port.onmessage = (event: MessageEvent<{ samples: Float32Array; rms: number; time: number }>) => {
           const { samples, rms, time } = event.data;
 
-          // Drop the hop rather than deepen the queue. The Worker sees the gap
-          // in `seq`, discards its window and refills before analysing again,
-          // so a dropped hop costs a moment of silence from the coach and never
-          // produces a decision computed from spliced audio. Letting `samples`
-          // fall out of scope releases it.
-          if (nextSeq - 1 - lastAnswered >= MAX_INFLIGHT_HOPS) return;
+          // Consume a capture sequence number for this hop whether or not it is
+          // forwarded. A null return means drop it rather than deepen the
+          // queue: the seq it consumed stays missing, so the Worker sees the
+          // gap, discards its window and refills before analysing again. A
+          // dropped hop therefore costs a moment of silence from the coach and
+          // never produces a decision computed from spliced audio. Letting
+          // `samples` fall out of scope releases it.
+          const seq = dispatcher.offer();
+          if (seq === null) return;
 
           // Transfer rather than copy — the worklet already handed ownership over.
-          worker.postMessage({ type: 'audio', seq: nextSeq++, samples, rms, time } satisfies ToWorker, [
+          worker.postMessage({ type: 'audio', seq, samples, rms, time } satisfies ToWorker, [
             samples.buffer,
           ]);
         };

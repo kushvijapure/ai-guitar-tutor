@@ -134,7 +134,18 @@ function ChordExplanation({
       return <p className="explain muted">Stay quiet for a second so I can learn your room.</p>;
 
     case 'silent':
-      return <p className="explain muted">Strum when you are ready.</p>;
+      // Not muted, and not phrased as a fault in the microphone: what has been
+      // established is that the measured noise floor contradicts the room, so
+      // the only honest instruction is to redo the measurement. The control it
+      // names is the one at the bottom of the stage.
+      return decision.calibrationUnusable ? (
+        <p className="explain">
+          The room was too noisy to calibrate, so I am ignoring everything you play. Get quiet,
+          then press &ldquo;Recalibrate noise&rdquo;.
+        </p>
+      ) : (
+        <p className="explain muted">Strum when you are ready.</p>
+      );
 
     case 'incomplete': {
       const count = decision.check?.pitchClassCount ?? 0;

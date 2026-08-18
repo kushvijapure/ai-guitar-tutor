@@ -102,12 +102,17 @@ export default function App() {
   const lastAnnounced = useRef('');
   useEffect(() => {
     if (!active) return;
-    const message = describeForScreenReader(decision?.status, chord.name, decision?.missing);
+    const message = describeForScreenReader(
+      decision?.status,
+      chord.name,
+      decision?.missing,
+      decision?.calibrationUnusable,
+    );
     if (message && message !== lastAnnounced.current) {
       lastAnnounced.current = message;
       setAnnouncement(message);
     }
-  }, [decision?.status, decision?.missing, chord.name, active]);
+  }, [decision?.status, decision?.missing, decision?.calibrationUnusable, chord.name, active]);
 
   const stop = useCallback(() => {
     setActive(false);
@@ -381,7 +386,18 @@ function describeForScreenReader(
   status: string | undefined,
   chordName: string,
   missing: string[] | null | undefined,
+  calibrationUnusable: boolean | undefined,
 ): string {
+  // Checked ahead of the status switch because the failure it describes
+  // presents AS 'silent': the room was measured too loud, so the player's
+  // actual guitar is being classified as silence. Announcing "waiting for you
+  // to play" to someone who is already playing, into an app that cannot hear
+  // them, is the precise confusion this state exists to end — and a sighted
+  // user gets the explanation from ChordStatusPanel either way.
+  if (calibrationUnusable) {
+    return 'The room was too noisy to calibrate. Get quiet, then use the Recalibrate noise button.';
+  }
+
   switch (status) {
     case 'calibrating': return 'Measuring room noise. Please stay quiet.';
     case 'silent': return 'Waiting for you to play.';

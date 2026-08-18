@@ -39,6 +39,7 @@ import {
   SILENCE_RESET_MS,
   SILENCE_RMS_ABSOLUTE,
   STABILITY_WINDOWS,
+  UNUSABLE_GATE_FRAMES,
   WRONG_CHORD_MARGIN,
 } from './thresholds';
 
@@ -76,6 +77,13 @@ export interface ChordDecision {
   level: number;
   /** 0..1 while calibrating. */
   calibrationProgress: number;
+  /**
+   * Calibration set a signal gate this room's own measurements contradict, so
+   * the player is very likely being ignored. See ChordDecider.watchGate for
+   * exactly what has been established when this is true — it is a statement
+   * about the calibration, never about the microphone.
+   */
+  calibrationUnusable: boolean;
 }
 
 export interface AnalysisFrame {
@@ -97,6 +105,7 @@ const IDLE: ChordDecision = {
   snrDb: -Infinity,
   level: 0,
   calibrationProgress: 1,
+  calibrationUnusable: false,
 };
 
 export class ChordDecider {
@@ -112,6 +121,12 @@ export class ChordDecider {
   private calibrationStart: number | null = null;
   private calibrationSamples: number[] = [];
   private calibrated = false;
+
+  /** Quietest frame seen since calibration finished. See watchGate. */
+  private quietestSinceCalibration = Infinity;
+  /** Consecutive-ish frames of audible-but-ignored sound. See watchGate. */
+  private unheardFrames = 0;
+  private gateUnusable = false;
 
   /**
    * Begin (or restart) noise-floor measurement. The caller is expected to ask
@@ -135,6 +150,11 @@ export class ChordDecider {
     this.calibrationStart = null;
     this.calibrationSamples = [];
     this.calibrated = false;
+    // The unusable-gate finding belongs to the calibration being replaced, and
+    // so does the room measurement it was judged against.
+    this.quietestSinceCalibration = Infinity;
+    this.unheardFrames = 0;
+    this.gateUnusable = false;
   }
 
   /** Reset all evidence. Used when a session stops or the lesson chord changes. */
@@ -142,6 +162,10 @@ export class ChordDecider {
     this.smoothed = null;
     this.lastSignalAt = null;
     this.agreeing = 0;
+    // Accumulated evidence, so it goes. The room measurement does not: it is
+    // paired with the calibration, which reset() does not discard.
+    this.unheardFrames = 0;
+    this.gateUnusable = false;
   }
 
   getNoiseFloor(): number {
@@ -193,8 +217,13 @@ export class ChordDecider {
     }
 
     // ---- Signal presence -------------------------------------------------
-    const hasSignal = rms >= this.signalGate();
+    const gate = this.signalGate();
+    const hasSignal = rms >= gate;
     const snrDb = this.noiseFloor > 0 ? 20 * Math.log10(rms / this.noiseFloor) : -Infinity;
+
+    // Before anything else: is this gate still defensible? Must run on the gate
+    // that judged this frame, i.e. before handleSilence adapts the floor.
+    this.watchGate(rms, gate, hasSignal);
 
     // A new expected chord invalidates accumulated agreement, otherwise the
     // stability earned on the previous chord would carry over and the next one
@@ -267,7 +296,80 @@ export class ChordDecider {
       snrDb,
       level: rms,
       calibrationProgress: 1,
+      calibrationUnusable: false,
     };
+  }
+
+  /**
+   * Notice when calibration has produced a signal gate this room's own
+   * measurements contradict.
+   *
+   * The failure being caught: calibrate while a lorry goes past, the floor is
+   * set from that, the gate lands above anything a guitar produces, and the app
+   * is deaf for the rest of the session while the level meter visibly moves.
+   * Nothing recovers from it. Adaptive drift is deliberately clamped to
+   * NOISE_FLOOR_ADAPT_MIN of the calibrated floor, so a calibration inflated by
+   * more than 1/that is permanently beyond its reach. This detector fires
+   * exactly where that existing recovery runs out of range.
+   *
+   * What is actually established, using only measurements already taken and
+   * only gates that already exist — no new threshold on what a guitar sounds
+   * like, because there is no validated corpus to derive one from:
+   *
+   *   (a) The calibration is contradicted. The quietest frame observed since
+   *       calibration is at least 1/NOISE_FLOOR_ADAPT_MIN below the floor
+   *       calibration measured, so the room is far quieter than the calibration
+   *       window claimed. Frame RMS over 8192 samples is a stable statistic for
+   *       stationary room tone, so the minimum is a fair estimate of it rather
+   *       than an outlier. This is the discriminating condition: a room that
+   *       merely got noisier later fails it, and correctly so — that is a
+   *       different problem, already served by adaptation and manual
+   *       recalibration.
+   *
+   *   (b) We are ignoring sound. This frame clears both the absolute floor and
+   *       NOISE_FLOOR_MARGIN above the room as actually observed — the app's
+   *       own definition of "the player is playing" — yet sits below the gate
+   *       we are enforcing.
+   *
+   *   (c) It is not a moment. UNUSABLE_GATE_FRAMES such frames have piled up
+   *       with not one frame in between ever clearing the gate.
+   *
+   * What is NOT established, and what the UI must therefore not claim: that the
+   * sound was a guitar, that the microphone is faulty, or that any particular
+   * chord was played. The only supportable message is that the calibration is
+   * suspect and should be redone in quiet. Recalibration is the player's to
+   * trigger; this never fires it, because silently re-measuring a room that is
+   * still noisy would just install a second bad floor and hide the problem.
+   *
+   * Known miss: a player who starts strumming the instant calibration ends and
+   * never pauses leaves no quiet frame, so (a) is never established and nothing
+   * is reported. Missing the case is the safe direction, and a pause of a
+   * single frame is enough to arm it.
+   */
+  private watchGate(level: number, gate: number, hasSignal: boolean): void {
+    if (!this.calibrated || !Number.isFinite(level) || level < 0) return;
+
+    if (hasSignal) {
+      // Something got through. Whatever we suspected, the gate is passing audio.
+      this.unheardFrames = 0;
+      this.gateUnusable = false;
+      return;
+    }
+
+    if (level < this.quietestSinceCalibration) this.quietestSinceCalibration = level;
+
+    // (a) Is the calibrated floor contradicted by the room itself?
+    if (this.quietestSinceCalibration > this.calibratedFloor * NOISE_FLOOR_ADAPT_MIN) return;
+
+    // (b) Would a gate built from the observed room have called this signal?
+    const honestGate = Math.max(
+      SILENCE_RMS_ABSOLUTE,
+      this.quietestSinceCalibration * NOISE_FLOOR_MARGIN,
+    );
+    if (level < honestGate || level >= gate) return;
+
+    // (c) Sustained.
+    if (++this.unheardFrames >= UNUSABLE_GATE_FRAMES) this.gateUnusable = true;
   }
 
   private handleSilence(now: number, level: number, snrDb: number): ChordDecision {
@@ -286,7 +388,16 @@ export class ChordDecider {
       }
     }
 
-    return { ...IDLE, status: 'silent', level, snrDb, calibrationProgress: 1 };
+    return {
+      ...IDLE,
+      status: 'silent',
+      level,
+      snrDb,
+      calibrationProgress: 1,
+      // The only state this can surface in: watchGate clears it the moment
+      // anything clears the gate, and every other status means something did.
+      calibrationUnusable: this.gateUnusable,
+    };
   }
 
   private finishCalibration(): void {

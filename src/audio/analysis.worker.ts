@@ -78,6 +78,13 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
     }
   } catch (error) {
     post({ type: 'error', message: error instanceof Error ? error.message : String(error) });
+    // An 'audio' message that threw part-way is still a forwarded hop the
+    // sender is counting as outstanding, and 'error' carries no seq to release
+    // it. Without this the in-flight count never returns to zero: a handful of
+    // failed frames would leave the sender permanently at its backpressure
+    // limit, discarding every subsequent hop, and the coach would go silent for
+    // the rest of the session over a transient fault.
+    if (message.type === 'audio') post({ type: 'ack', seq: message.seq });
   }
 };
 

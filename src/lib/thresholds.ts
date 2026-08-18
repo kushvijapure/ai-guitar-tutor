@@ -122,6 +122,24 @@ export const NOISE_FLOOR_ADAPT_RATE = 0.02;
 export const NOISE_FLOOR_ADAPT_MIN = 0.25;
 export const NOISE_FLOOR_ADAPT_MAX = 4;
 
+/**
+ * How many frames of "there is sound here and we are calling it silence" must
+ * accumulate before the app says the calibration is unusable.
+ *
+ * This is a patience window, NOT a detection threshold. What counts as sound is
+ * decided entirely by NOISE_FLOOR_MARGIN and SILENCE_RMS_ABSOLUTE — the gates
+ * that already exist — measured against the quietest this room has actually
+ * been since calibration. This number only decides how long we wait before
+ * saying so, and changing it cannot make the app accept or reject a chord.
+ *
+ * 64 frames is ~3.0 s at the 21.5 Hz analysis rate. Long enough that a passing
+ * lorry or a chair scrape cannot trigger the message, short enough that a
+ * player who has been strumming into a deaf app finds out quickly. Not measured
+ * against real sessions; nothing here has been. See ChordDecider for what the
+ * detection itself rests on.
+ */
+export const UNUSABLE_GATE_FRAMES = 64;
+
 // ---------------------------------------------------------------------------
 // Chroma
 // ---------------------------------------------------------------------------
