@@ -145,9 +145,9 @@ The wrong chord scores *higher* than the right one, so **no threshold on that
 score can separate them**. Details in
 [docs/audio-recognition.md](docs/audio-recognition.md#the-added-note-gap).
 
-There is also **no LICENSE file**, which makes this "all rights reserved" by
-default — nobody can legally use, fork, or contribute to it. That is a release
-blocker left deliberately for the repository owner to decide.
+## License
+
+[MIT](LICENSE).
 
 ## Documentation
 

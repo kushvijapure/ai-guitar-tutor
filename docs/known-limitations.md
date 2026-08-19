@@ -7,38 +7,35 @@ knows it cannot do, kept visible on purpose.
 
 ## Release blockers
 
-Ordered by severity. **This should not be published until at least 1–3 are
-resolved.**
+Ordered by severity.
 
-1. **No LICENSE file.** The repository has no license, which means it is
-   "all rights reserved" by default — nobody can legally use, fork, or contribute
-   to it. This is deliberately left for the owner to decide; a license has **not**
-   been chosen on their behalf. Add one before publishing.
+*Resolved: the repository is now MIT licensed. It was previously unlicensed,
+and therefore "all rights reserved" despite being public.*
 
-2. **Real-world validation has not been done.** Everything is verified against
+1. **Real-world validation has not been done.** Everything is verified against
    synthetic signals only, including every browser observation. No real guitar,
    microphone or camera has been used at any point. Until that changes, the app
    must not be described as accurate. See [validation.md](validation.md).
 
-3. **Handedness correction is unverified** against a real camera, and untested
+2. **Handedness correction is unverified** against a real camera, and untested
    with a left-handed player. See
    [hand-tracking.md](hand-tracking.md#handedness-is-unverified).
 
-4. **No real-hardware browser smoke test.** The build, type-check, lint and unit
+3. **No real-hardware browser smoke test.** The build, type-check, lint and unit
    tests pass, and the pipeline has been exercised in Chrome against a *stubbed*
    `getUserMedia`. It has never been loaded with a real microphone since the
    audio pipeline moved to a Worklet + Worker. Permission grant, denial and
    mid-session revocation are all untested.
 
-5. **Third-party model download** on first load unless `fetch-assets` has run.
+4. **Third-party model download** on first load unless `fetch-assets` has run.
    Fine for local use; decide deliberately before deploying.
 
-6. **Thresholds are reasoned but not empirically optimal.** `npm run measure`
+5. **Thresholds are reasoned but not empirically optimal.** `npm run measure`
    shows the headroom: on synthetic signals the tightest legitimate chord clears
    the score gate by **0.036** and the margin gate by **0.026**. Real signals
    will be tighter than that.
 
-7. **The added-note false-accept is unresolved and not tunable.** A C with a
+6. **The added-note false-accept is unresolved and not tunable.** A C with a
    quiet added F scores 0.901 against the C template while a legitimately bright
    C scores 0.896, so no threshold separates them. See
    [audio-recognition.md](audio-recognition.md#the-added-note-gap).
