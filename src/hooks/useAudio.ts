@@ -1,137 +1,268 @@
-import { useEffect, useRef, useState } from 'react';
-import { detectPitch } from '../lib/pitch';
-import { computeChroma, matchChord, type Chroma, type ChordMatch } from '../lib/chroma';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { AnalysisStats, FromWorker, PitchReading, ToWorker } from '../audio/messages';
+import type { ChordDecision } from '../lib/chordDecision';
+import type { ChordSpec } from '../lib/chroma';
+import { describeMediaError, type MediaFailure } from '../lib/mediaErrors';
+import { FRAME_SIZE, HOP_SIZE, MAX_INFLIGHT_HOPS, UI_UPDATE_HZ } from '../lib/thresholds';
+import { HopDispatcher } from '../audio/backpressure';
 
-const FFT_SIZE = 8192; // ~5.4 Hz resolution at 44.1 kHz — enough to separate low frets.
-/** Smoothing on the chroma vector. Raw frames flicker badly during a strum decay. */
-const CHROMA_SMOOTHING = 0.6;
+/**
+ * Microphone capture and chord analysis.
+ *
+ * Thread layout, and why:
+ *
+ *   audio thread   capture-worklet.js   reblocks 128-sample quanta into hops
+ *   main thread    (relay only)         transfers each hop onward, no DSP
+ *   worker thread  analysis.worker.ts   FFT, YIN, chord decision
+ *   main thread    this hook            throttles results into React state
+ *
+ * The prototype ran YIN and an FFT on the main thread inside requestAnimationFrame
+ * and called setState on every frame, so it did ~5 million operations per frame
+ * at 60 Hz and re-rendered the whole app each time. Nothing here runs on the
+ * main thread except passing buffers along.
+ *
+ * Note that the decision state machine lives in the Worker, at the full analysis
+ * rate. Throttling React updates therefore changes only how often the player
+ * sees a number change — it cannot weaken the gates that decide correctness.
+ */
 
-export interface AudioAnalysis {
-  /** Detected fundamental, monophonic. Null when silent or unclear. */
-  frequency: number | null;
-  clarity: number;
-  /** Smoothed 12-bin pitch-class profile. */
-  chroma: Chroma | null;
-  /** Top chord candidates, best first. */
-  chords: ChordMatch[];
-  /** Peak level 0..1, for the input meter. */
-  level: number;
+export type AudioStatus = 'idle' | 'requesting' | 'starting' | 'running' | 'error';
+
+export interface AudioState {
+  decision: ChordDecision | null;
+  pitch: PitchReading | null;
+  stats: AnalysisStats | null;
 }
 
-export type AudioStatus = 'idle' | 'loading' | 'running' | 'error';
+const EMPTY: AudioState = { decision: null, pitch: null, stats: null };
 
-const EMPTY: AudioAnalysis = {
-  frequency: null,
-  clarity: 0,
-  chroma: null,
-  chords: [],
-  level: 0,
-};
-
-export function useAudio(enabled: boolean) {
-  const [analysis, setAnalysis] = useState<AudioAnalysis>(EMPTY);
+export function useAudio(enabled: boolean, expected: ChordSpec) {
+  const [state, setState] = useState<AudioState>(EMPTY);
   const [status, setStatus] = useState<AudioStatus>('idle');
-  const [error, setError] = useState<string | null>(null);
+  const [failure, setFailure] = useState<MediaFailure | null>(null);
+  /** Whatever the browser actually gave us — 44.1 or 48 kHz, not an assumption. */
+  const [sampleRate, setSampleRate] = useState<number | null>(null);
 
-  const contextRef = useRef<AudioContext | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const rafRef = useRef<number | null>(null);
-  const smoothedChroma = useRef<Float32Array | null>(null);
+  const workerRef = useRef<Worker | null>(null);
+  /** Newest result from the worker, drained into React on a fixed cadence. */
+  const pending = useRef<AudioState | null>(null);
+
+  // Read during start-up without making the target chord a dependency of the
+  // effect that builds the audio graph — changing chord must not tear the
+  // microphone down and ask for permission again.
+  const expectedRef = useRef(expected);
+  expectedRef.current = expected;
+
+  // Keep the worker's target chord in sync without restarting the pipeline.
+  useEffect(() => {
+    workerRef.current?.postMessage({ type: 'expected', chord: expected } satisfies ToWorker);
+  }, [expected]);
+
+  const calibrate = useCallback(() => {
+    workerRef.current?.postMessage({ type: 'calibrate' } satisfies ToWorker);
+  }, []);
 
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled) {
+      setStatus('idle');
+      setState(EMPTY);
+      setFailure(null);
+      return;
+    }
 
     let cancelled = false;
 
-    async function start() {
-      try {
-        setStatus('loading');
+    // Every resource acquired gets a teardown pushed here immediately, so an
+    // failure part-way through start-up still releases what already succeeded.
+    // Repeated start/stop cycles were leaking microphone streams otherwise.
+    const teardown: Array<() => void> = [];
 
-        const stream = await navigator.mediaDevices.getUserMedia({
+    /**
+     * Release everything acquired so far, newest first.
+     *
+     * Drains the list rather than iterating it, which is what makes this safe to
+     * call more than once and — more importantly — safe to call *after* the
+     * effect's cleanup has already run. Start-up is asynchronous, so a fast
+     * enable/disable can run cleanup while getUserMedia is still pending; the
+     * stream then resolves into a teardown list nobody is going to read again.
+     * Every cancellation path below therefore calls this instead of simply
+     * returning, or the microphone stays live with its indicator lit and no way
+     * to reach it.
+     */
+    function release() {
+      for (const step of teardown.splice(0).reverse()) {
+        try {
+          step();
+        } catch {
+          // A teardown step failing must not prevent the rest from running.
+        }
+      }
+    }
+
+    async function start() {
+      let stream: MediaStream | undefined;
+      let context: AudioContext | undefined;
+
+      try {
+        setStatus('requesting');
+        setFailure(null);
+
+        stream = await navigator.mediaDevices.getUserMedia({
           audio: {
-            // All three off: they're tuned for speech and will chew up a guitar.
+            // All three off: they are tuned for speech and will chew a guitar
+            // apart — noise suppression in particular gates sustained notes.
             echoCancellation: false,
             noiseSuppression: false,
             autoGainControl: false,
           },
         });
-        if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-        streamRef.current = stream;
+        const acquired = stream;
+        teardown.push(() => acquired.getTracks().forEach((t) => t.stop()));
+        if (cancelled) return release();
 
-        const context = new AudioContext();
-        contextRef.current = context;
+        setStatus('starting');
 
-        const source = context.createMediaStreamSource(stream);
-        const analyser = context.createAnalyser();
-        analyser.fftSize = FFT_SIZE;
-        analyser.smoothingTimeConstant = 0.3;
-        source.connect(analyser);
+        context = new AudioContext();
+        const ctx = context;
+        setSampleRate(ctx.sampleRate);
+        teardown.push(() => void ctx.close().catch(() => {}));
+        if (ctx.state === 'suspended') await ctx.resume();
+        if (cancelled) return release();
 
-        const timeData = new Float32Array(analyser.fftSize);
-        const freqData = new Float32Array(analyser.frequencyBinCount);
+        await ctx.audioWorklet.addModule(new URL('../audio/capture-worklet.js', import.meta.url));
+        if (cancelled) return release();
 
-        if (cancelled) return;
+        const worker = new Worker(new URL('../audio/analysis.worker.ts', import.meta.url), {
+          type: 'module',
+        });
+        teardown.push(() => worker.terminate());
+        workerRef.current = worker;
+        teardown.push(() => {
+          if (workerRef.current === worker) workerRef.current = null;
+        });
+
+        worker.postMessage({
+          type: 'init',
+          sampleRate: ctx.sampleRate,
+          frameSize: FRAME_SIZE,
+          hopSize: HOP_SIZE,
+        } satisfies ToWorker);
+        worker.postMessage({ type: 'expected', chord: expectedRef.current } satisfies ToWorker);
+        worker.postMessage({ type: 'calibrate' } satisfies ToWorker);
+
+        // Backpressure. See HopDispatcher for why this needs two counters and
+        // not one: the capture sequence must advance for discarded hops so the
+        // Worker can see the hole, while the in-flight count must not, so the
+        // queue stays bounded. Fresh per session, so a restart starts clean.
+        const dispatcher = new HopDispatcher(MAX_INFLIGHT_HOPS);
+        teardown.push(() => dispatcher.reset());
+
+        worker.onmessage = (event: MessageEvent<FromWorker>) => {
+          const message = event.data;
+          if (message.type === 'error') {
+            setStatus('error');
+            setFailure({
+              title: 'Audio analysis failed',
+              detail: `${message.message} Reloading the page usually clears this.`,
+              recoverable: true,
+            });
+            return;
+          }
+          // Every forwarded hop is answered exactly once, by an 'ack' if it only
+          // filled the window or a 'decision' if it was analysed.
+          dispatcher.answered(message.seq);
+          if (message.type === 'ack') return;
+
+          // Overwrite rather than queue: if React is behind, the newest reading
+          // is the only one worth showing.
+          pending.current = {
+            decision: message.decision,
+            pitch: message.pitch,
+            // The Worker infers drops from gaps in the sequence, which cannot
+            // see hops discarded before the first forward or after the last.
+            // The sender counted them where they happened, so report that.
+            stats: { ...message.stats, dropped: dispatcher.discarded },
+          };
+        };
+
+        const source = ctx.createMediaStreamSource(stream);
+        teardown.push(() => source.disconnect());
+
+        const capture = new AudioWorkletNode(ctx, 'capture', {
+          numberOfInputs: 1,
+          numberOfOutputs: 1,
+          processorOptions: { hopSize: HOP_SIZE },
+        });
+        teardown.push(() => {
+          capture.port.postMessage('stop');
+          capture.port.onmessage = null;
+          capture.disconnect();
+        });
+
+        capture.port.onmessage = (event: MessageEvent<{ samples: Float32Array; rms: number; time: number }>) => {
+          const { samples, rms, time } = event.data;
+
+          // Consume a capture sequence number for this hop whether or not it is
+          // forwarded. A null return means drop it rather than deepen the
+          // queue: the seq it consumed stays missing, so the Worker sees the
+          // gap, discards its window and refills before analysing again. A
+          // dropped hop therefore costs a moment of silence from the coach and
+          // never produces a decision computed from spliced audio. Letting
+          // `samples` fall out of scope releases it.
+          const seq = dispatcher.offer();
+          if (seq === null) return;
+
+          // Transfer rather than copy — the worklet already handed ownership over.
+          worker.postMessage({ type: 'audio', seq, samples, rms, time } satisfies ToWorker, [
+            samples.buffer,
+          ]);
+        };
+
+        // A muted sink keeps the graph pulling. Without a path to the
+        // destination some browsers never schedule the worklet's process().
+        const mute = ctx.createGain();
+        mute.gain.value = 0;
+        teardown.push(() => mute.disconnect());
+
+        source.connect(capture);
+        capture.connect(mute);
+        mute.connect(ctx.destination);
+
+        // Drain the newest result into React on a fixed cadence rather than on
+        // every message. Analysis stays at ~21 Hz; the UI settles for ~12.
+        const flush = setInterval(() => {
+          if (pending.current) {
+            setState(pending.current);
+            pending.current = null;
+          }
+        }, 1000 / UI_UPDATE_HZ);
+        teardown.push(() => clearInterval(flush));
+
+        if (cancelled) return release();
         setStatus('running');
-
-        function loop() {
-          analyser.getFloatTimeDomainData(timeData);
-          analyser.getFloatFrequencyData(freqData);
-
-          let peak = 0;
-          for (let i = 0; i < timeData.length; i++) {
-            peak = Math.max(peak, Math.abs(timeData[i]));
-          }
-
-          const pitch = detectPitch(timeData, context.sampleRate);
-          const rawChroma = computeChroma(freqData, context.sampleRate);
-
-          if (rawChroma) {
-            if (!smoothedChroma.current) {
-              smoothedChroma.current = new Float32Array(rawChroma);
-            } else {
-              const prev = smoothedChroma.current;
-              for (let i = 0; i < 12; i++) {
-                prev[i] = prev[i] * CHROMA_SMOOTHING + rawChroma[i] * (1 - CHROMA_SMOOTHING);
-              }
-            }
-          }
-
-          const chroma = smoothedChroma.current;
-          setAnalysis({
-            frequency: pitch?.frequency ?? null,
-            clarity: pitch?.clarity ?? 0,
-            chroma: chroma ? new Float32Array(chroma) : null,
-            chords: chroma && peak > 0.01 ? matchChord(chroma) : [],
-            level: peak,
-          });
-
-          rafRef.current = requestAnimationFrame(loop);
-        }
-
-        loop();
-      } catch (err) {
+      } catch (error) {
+        // Start-up failed part-way. Whatever already succeeded is still holding
+        // the microphone open behind a pipeline that will never run.
+        release();
         if (cancelled) return;
         setStatus('error');
-        setError(err instanceof Error ? err.message : String(err));
+        setFailure(describeMediaError(error, 'microphone'));
       }
     }
 
-    start();
+    void start();
 
     return () => {
       cancelled = true;
-      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-      contextRef.current?.close();
-      contextRef.current = null;
-      smoothedChroma.current = null;
+      // Reverse acquisition order, so nodes are disconnected and the worker is
+      // gone before the context closes and the tracks stop.
+      release();
+      pending.current = null;
+      setState(EMPTY);
       setStatus('idle');
-      setAnalysis(EMPTY);
+      setSampleRate(null);
     };
   }, [enabled]);
 
-  return { analysis, status, error };
+  return { ...state, status, failure, calibrate, sampleRate };
 }

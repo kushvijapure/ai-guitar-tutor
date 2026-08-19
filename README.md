@@ -1,100 +1,166 @@
-# Guitar Tutor
+# AI Guitar Tutor
 
-A browser-based practice coach that watches your fretting hand through the webcam
-and listens to what you play through the microphone, then tells you what to fix.
-Everything runs client-side — the camera and microphone streams never leave your
-machine.
+A privacy-first browser coach that listens to guitar chords, watches fretting-hand posture, and refuses to guess when the evidence is unreliable.
 
-## What it actually does
+![The Guitar Tutor session screen, showing what the app can and cannot tell you before a session starts](docs/assets/session-intro.png)
 
-The interesting design decision here is **splitting the two questions a guitar
-teacher answers**:
+![Status: beta](https://img.shields.io/badge/status-beta-f59e0b)
+![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6?logo=typescript&logoColor=white)
+![React 19](https://img.shields.io/badge/React-19-61dafb?logo=react&logoColor=white)
+![Vite](https://img.shields.io/badge/Vite-8-646cff?logo=vite&logoColor=white)
+![Processing: 100% client-side](https://img.shields.io/badge/processing-100%25%20client--side-5eead4)
 
-- **"Did you play the right notes?"** — answered from **audio**, not video. The
-  microphone signal is far more reliable for this than trying to read fret
-  positions off a camera. A [YIN](https://en.wikipedia.org/wiki/Pitch_detection_algorithm)
-  pitch detector handles single notes and the tuner; a 12-bin **chroma** (pitch-class
-  profile) matched against chord templates with cosine similarity handles strummed
-  chords. When a chord is wrong, it diagnoses *which tone is missing* rather than
-  just saying "no."
+<!--
+  A CI badge belongs here once .github/workflows/ci.yml has actually been pushed
+  and has run green on the default branch. It is deliberately absent until then:
+  a badge for a workflow that has never run is a claim, not a status.
 
-- **"Is your hand doing it well?"** — answered from **video**. MediaPipe's hand
-  landmarker gives 21 3D points per hand; from those we derive finger curl,
-  wrist/palm rotation, and thumb placement, and surface the cues a teacher gives
-  most: *arch that finger, drop your thumb behind the neck, flatten your wrist.*
+  ![CI](https://github.com/kushvijapure/ai-guitar-tutor/actions/workflows/ci.yml/badge.svg)
+-->
 
-### Why not detect frets from the camera?
+> **Beta.** The decision logic is unit-tested and the pipeline has been exercised
+> in a browser against *synthetic* audio. It has **not** been validated with a real
+> guitar, a real microphone, or a real camera, and no accuracy figure is claimed
+> anywhere in this repository. See [Validation status](#validation-status).
 
-Because it doesn't work well enough to teach with. Fret spacing above the 7th fret
-is a few millimetres at webcam resolution, and your fretting hand occludes the exact
-region you'd need to see. Inferring string/fret from landmarks alone is a research
-problem, and a wrong "you're on the 3rd fret" is worse than no claim at all. Audio
-sidesteps this entirely — it knows what you played regardless of where the camera is.
-The hand tracking sticks to what landmarks *are* reliable for: hand shape.
-
-## Running it
+## Run locally
 
 ```bash
 npm install
 npm run dev      # http://localhost:5173
 ```
 
-Grant camera and microphone permission when prompted. Turn off any audio "noise
-suppression" in your OS if notes drop out — those filters are tuned for speech and
-fight the guitar.
+Grant microphone permission when prompted; the camera is optional. Turn off any
+OS-level audio "noise suppression" — those filters are tuned for speech and fight
+a guitar. Stay quiet for the first second or so while the room noise floor is
+measured.
 
-### Other scripts
+**There is no hosted demo.** This project is not deployed anywhere, so the only
+way to run it is locally.
 
-```bash
-npm run build    # typecheck + production build
-npm run verify   # run the DSP checks against synthetic signals
-npm run lint
+| Command | What it does |
+| --- | --- |
+| `npm run dev` | Dev server. Stages MediaPipe assets first. |
+| `npm test` | 329 unit tests across DSP, pitch, chords, decisions, posture and the audio transport. |
+| `npm run measure` | Prints every decision gate across 27 scenarios. Use when changing a threshold. |
+| `npm run verify` | End-to-end DSP smoke check. |
+| `npm run bench` | Analysis cost and real-time factor. |
+| `npm run ci` | typecheck → lint → test → verify → build, in the order CI runs them. |
+
+## What it does
+
+**Hears whether you played the right notes.** A 12-bin chroma is matched against
+chord templates, then put through gates that similarity alone cannot answer —
+distinct pitch-class count, characteristic-tone presence, top-match margin, and
+agreement across four consecutive analysis windows.
+
+**Watches the fingers the chord actually uses.** MediaPipe's 21 hand landmarks
+become per-finger joint angles. Fingers the current chord does not fret are not
+judged, and any finger the geometry cannot measure reliably is reported as
+unmeasurable rather than guessed at.
+
+**Says "I can't tell" out loud.** *Can't tell yet*, *Unable to assess reliably*
+and *That is a different chord* are first-class outcomes, not placeholders.
+
+**Never sends your audio or video anywhere.** No backend, no telemetry, no
+uploads. Everything runs in the browser tab.
+
+## The design principle
+
+**An incorrect correction is worse than no correction.** A player told their
+finger is flat when it isn't will "fix" something that was already right, and
+they have no way to know the coach was wrong.
+
+So every judgement is gated, and when a gate fails the app reports that it cannot
+tell instead of guessing. This has a real cost: the app stays quiet in situations
+where a more confident tool would say something, and some genuinely correct
+playing will not be confirmed. That trade is deliberate.
+
+It is also why capabilities were *removed* rather than approximated. The app
+cannot see the fretboard, so it no longer claims your wrist is wrong relative to
+a neck it cannot locate — wrist and thumb notes are now tentative observations,
+phrased conditionally and never counted as errors.
+
+<p align="center">
+  <img src="docs/assets/chord-decision-panel.png" width="330"
+       alt="Coaching panel reading: A minor, 'That is a different chord — that sounds like Em, not A minor'">
+</p>
+<p align="center">
+  <em>The coach naming what it actually heard instead of failing silently.<br>
+  Captured with <strong>simulated audio input</strong> — a synthesised open Em, not a real guitar.</em>
+</p>
+
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph AUDIO["Audio — did you play the right notes?"]
+    direction LR
+    MIC[Microphone] --> AW[AudioWorklet<br/>reblock + RMS]
+    AW --> RELAY[Main-thread relay<br/>transfer only, no DSP]
+    RELAY --> WORKER[Analysis Worker<br/>FFT · YIN · chroma]
+    WORKER --> SM[Chord decision<br/>state machine]
+  end
+
+  subgraph VIDEO["Video — is your hand doing it well?"]
+    direction LR
+    CAM[Camera] --> MP[MediaPipe<br/>HandLandmarker]
+    MP --> GATES[Reliability gates<br/>+ smoothing]
+    GATES --> POSTURE[Posture analysis]
+  end
+
+  SM --> UI[React UI]
+  POSTURE --> UI
 ```
 
-`npm run verify` proves the pitch and chord maths against generated tones — useful
-because you can't unit-test "does it feel right with a real guitar" in CI. It is not
-a substitute for playing into it; room noise, pickup hum, and cheap mics all degrade
-the real-world signal in ways synthetic tones don't capture.
+The audio thread only reblocks and measures level. All DSP happens in the Worker,
+where the decision state machine also runs at the full analysis rate — so
+throttling the UI to 12 Hz changes only how often numbers move on screen. It
+cannot weaken a correctness gate.
 
-## The first lesson
+## Validation status
 
-Open chords — Em, Am, C, G, D — in roughly increasing difficulty. Each chord shows a
-diagram, a one-line tip for the mistake that shape invites, a live match meter, and
-posture cues. Hold a chord clean for 1.5 s and it advances.
+**The automated logic and simulated browser lifecycle pass; real-player coaching
+accuracy remains unvalidated.**
 
-## Layout
+| | Status |
+| --- | --- |
+| 329 unit tests, 9 files | Passing |
+| DSP verification, gate measurement, typecheck, lint, build | Passing |
+| Browser lifecycle (worklet → worker → UI, start/stop) | Passing — **with stubbed `getUserMedia` over synthetic audio** |
+| Real guitar, real microphone | **Not done** |
+| Real camera, real hands, handedness | **Not done** |
+| Permission dialogs and denial paths | **Not done** |
 
-```
-src/
-  lib/
-    pitch.ts      YIN monophonic pitch detection (tuner, single notes)
-    chroma.ts     chroma extraction + chord template matching + missing-tone diagnosis
-    notes.ts      note naming, cents, standard-tuning reference
-    posture.ts    hand-landmark geometry -> coaching cues
-  hooks/
-    useHandTracking.ts   MediaPipe hand landmarker over the webcam
-    useAudio.ts          Web Audio analyser -> pitch + chroma per frame
-  components/
-    CameraView.tsx    video + skeleton overlay
-    ChordDiagram.tsx  SVG chord box
-    FeedbackPanel.tsx  posture cues
-  lessons/
-    openChords.ts   chord shapes + lesson definition
-  App.tsx           session state, hold-to-pass loop, layout
-scripts/
-  verify-dsp.ts     synthetic-signal checks for the DSP
-```
+Every browser observation recorded in this project so far used a stubbed
+`getUserMedia` over a synthetic source. No real microphone, camera, or guitar has
+been used at any point. Synthetic signals have no inharmonicity, no fret buzz, no
+body resonance, no room, and a noise profile no real microphone produces — so the
+tests demonstrate that the logic behaves as designed, not that the coaching is
+correct for a real player.
 
-## Known limits
+One recognition gap is known and unresolved: a C major with an added F scores
+**0.901** against the C template, while a legitimately bright C scores **0.896**.
+The wrong chord scores *higher* than the right one, so **no threshold on that
+score can separate them**. Details in
+[docs/audio-recognition.md](docs/audio-recognition.md#the-added-note-gap).
 
-- Chord matching is octave-blind and template-based; it won't distinguish
-  inversions or voicings, and slash chords read as their base triad.
-- Posture cues assume a roughly side-on view of the fretting hand. A head-on angle
-  confuses palm-rotation estimates.
-- One lesson so far. The lesson format (`src/lessons`) is structured to add more:
-  strumming patterns, chord transitions, single-note exercises.
+## License
+
+[MIT](LICENSE).
+
+## Documentation
+
+| Document | Contents |
+| --- | --- |
+| [Architecture](docs/architecture.md) | Threading model, module map, measured performance |
+| [Audio recognition](docs/audio-recognition.md) | Chroma, the five gates, measured scores, the added-note gap |
+| [Hand tracking](docs/hand-tracking.md) | Landmark geometry, reliability gating, what was removed |
+| [Validation](docs/validation.md) | What has been tested, how, and what a real evaluation requires |
+| [Known limitations](docs/known-limitations.md) | Limits, release blockers, third-party asset story |
 
 ## Stack
 
-React + TypeScript + Vite, MediaPipe Tasks Vision (hand landmarker), Web Audio API.
-No backend, no build step beyond Vite, no data leaves the browser.
+React 19 + TypeScript (strict) + Vite, MediaPipe Tasks Vision (hand landmarker),
+Web Audio API with a custom FFT. No backend, no telemetry, no data leaves the
+browser.
