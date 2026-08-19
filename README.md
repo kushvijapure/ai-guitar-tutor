@@ -10,13 +10,7 @@ A privacy-first browser coach that listens to guitar chords, watches fretting-ha
 ![Vite](https://img.shields.io/badge/Vite-8-646cff?logo=vite&logoColor=white)
 ![Processing: 100% client-side](https://img.shields.io/badge/processing-100%25%20client--side-5eead4)
 
-<!--
-  A CI badge belongs here once .github/workflows/ci.yml has actually been pushed
-  and has run green on the default branch. It is deliberately absent until then:
-  a badge for a workflow that has never run is a claim, not a status.
-
-  ![CI](https://github.com/kushvijapure/ai-guitar-tutor/actions/workflows/ci.yml/badge.svg)
--->
+[![CI](https://github.com/kushvijapure/ai-guitar-tutor/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kushvijapure/ai-guitar-tutor/actions/workflows/ci.yml)
 
 > **Beta.** The decision logic is unit-tested and the pipeline has been exercised
 > in a browser against *synthetic* audio. It has **not** been validated with a real
